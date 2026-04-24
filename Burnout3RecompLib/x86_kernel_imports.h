@@ -1,0 +1,306 @@
+#pragma once
+#include <cstdint>
+
+// 0x36B7C0 -> XcSHAUpdate
+// 0x36B7C4 -> XcSHAInit
+// 0x36B7C8 -> XcSHAFinal
+// 0x36B7CC -> XboxHDKey
+// 0x36B7D0 -> XboxSignatureKey
+// 0x36B7D4 -> XboxAlternateSignatureKeys
+// 0x36B7D8 -> ExQueryNonVolatileSetting
+// 0x36B7DC -> KeQuerySystemTime
+// 0x36B7E0 -> NtClose
+// 0x36B7E4 -> NtQueryVolumeInformationFile
+// 0x36B7E8 -> NtOpenFile
+// 0x36B7EC -> RtlInitAnsiString
+// 0x36B7F0 -> NtWriteFile
+// 0x36B7F4 -> HalDiskCachePartitionCount
+// 0x36B7F8 -> NtReadFile
+// 0x36B7FC -> IoCreateSymbolicLink
+// 0x36B800 -> NtQuerySymbolicLinkObject
+// 0x36B804 -> NtOpenSymbolicLinkObject
+// 0x36B808 -> IoDeleteSymbolicLink
+// 0x36B80C -> RtlNtStatusToDosError
+// 0x36B810 -> NtFsControlFile
+// 0x36B814 -> MmAllocateContiguousMemoryEx
+// 0x36B818 -> MmQueryAllocationSize
+// 0x36B81C -> MmSetAddressProtect
+// 0x36B820 -> MmFreeContiguousMemory
+// 0x36B824 -> MmQueryAddressProtect
+// 0x36B828 -> HalBootSMCVideoMode
+// 0x36B82C -> MmPersistContiguousMemory
+// 0x36B830 -> MmAllocateContiguousMemory
+// 0x36B834 -> LaunchDataPage
+// 0x36B838 -> HalReturnToFirmware
+// 0x36B83C -> NtCreateFile
+// 0x36B840 -> NtSetInformationFile
+// 0x36B844 -> NtQueryInformationFile
+// 0x36B848 -> NtWaitForSingleObject
+// 0x36B84C -> NtFlushBuffersFile
+// 0x36B850 -> NtDeviceIoControlFile
+// 0x36B854 -> ObfDereferenceObject
+// 0x36B858 -> ObReferenceObjectByHandle
+// 0x36B85C -> IoFileObjectType
+// 0x36B860 -> NtCreateEvent
+// 0x36B864 -> ExEventObjectType
+// 0x36B868 -> NtSetEvent
+// 0x36B86C -> NtCreateSemaphore
+// 0x36B870 -> NtReleaseSemaphore
+// 0x36B874 -> NtWaitForSingleObjectEx
+// 0x36B878 -> KeDelayExecutionThread
+// 0x36B87C -> RtlLeaveCriticalSection
+// 0x36B880 -> RtlEnterCriticalSection
+// 0x36B884 -> KeSetBasePriorityThread
+// 0x36B888 -> PsThreadObjectType
+// 0x36B88C -> KeQueryBasePriorityThread
+// 0x36B890 -> RtlRaiseException
+// 0x36B894 -> NtYieldExecution
+// 0x36B898 -> PsTerminateSystemThread
+// 0x36B89C -> PsCreateSystemThreadEx
+// 0x36B8A0 -> NtDuplicateObject
+// 0x36B8A4 -> NtQueryFullAttributesFile
+// 0x36B8A8 -> NtQueryDirectoryFile
+// 0x36B8AC -> RtlAnsiStringToUnicodeString
+// 0x36B8B0 -> RtlUnicodeStringToAnsiString
+// 0x36B8B4 -> KfLowerIrql
+// 0x36B8B8 -> KeRaiseIrqlToDpcLevel
+// 0x36B8BC -> RtlTimeToTimeFields
+// 0x36B8C0 -> KeTickCount
+// 0x36B8C4 -> RtlTimeFieldsToTime
+// 0x36B8C8 -> KeSaveFloatingPointState
+// 0x36B8CC -> KeRestoreFloatingPointState
+// 0x36B8D0 -> XboxHardwareInfo
+// 0x36B8D4 -> HalRegisterShutdownNotification
+// 0x36B8D8 -> XeImageFileName
+// 0x36B8DC -> KeInitializeTimerEx
+// 0x36B8E0 -> KeSetTimer
+// 0x36B8E4 -> KeCancelTimer
+// 0x36B8E8 -> KeSetEvent
+// 0x36B8EC -> KeWaitForSingleObject
+// 0x36B8F0 -> KeInitializeDpc
+// 0x36B8F4 -> XboxKrnlVersion
+// 0x36B8F8 -> RtlEqualString
+// 0x36B8FC -> XeLoadSection
+// 0x36B900 -> XeUnloadSection
+// 0x36B904 -> NtFreeVirtualMemory
+// 0x36B908 -> NtAllocateVirtualMemory
+// 0x36B90C -> RtlCompareMemoryUlong
+// 0x36B910 -> RtlInitializeCriticalSection
+// 0x36B914 -> NtQueryVirtualMemory
+// 0x36B918 -> HalInitiateShutdown
+// 0x36B91C -> IdexChannelObject
+// 0x36B920 -> XcHMAC
+// 0x36B924 -> ExAllocatePoolWithTag
+// 0x36B928 -> ExFreePool
+// 0x36B92C -> HalGetInterruptVector
+// 0x36B930 -> KfRaiseIrql
+// 0x36B934 -> KeConnectInterrupt
+// 0x36B938 -> KeInitializeInterrupt
+// 0x36B93C -> KeStallExecutionProcessor
+// 0x36B940 -> MmGetPhysicalAddress
+// 0x36B944 -> MmLockUnlockBufferPages
+// 0x36B948 -> KeInsertQueueDpc
+// 0x36B94C -> MmLockUnlockPhysicalPage
+// 0x36B950 -> AvGetSavedDataAddress
+// 0x36B954 -> AvSendTVEncoderOption
+// 0x36B958 -> AvSetSavedDataAddress
+// 0x36B95C -> AvSetDisplayMode
+// 0x36B960 -> KeDisconnectInterrupt
+// 0x36B964 -> HalReadWritePCISpace
+// 0x36B968 -> MmClaimGpuInstanceMemory
+// 0x36B96C -> DbgPrint
+// 0x36B970 -> ExQueryPoolBlockSize
+// 0x36B974 -> KeRemoveQueueDpc
+// 0x36B978 -> KeSynchronizeExecution
+// 0x36B97C -> PhyGetLinkState
+// 0x36B980 -> PhyInitialize
+// 0x36B984 -> KeWaitForMultipleObjects
+// 0x36B988 -> XcBlockCryptCBC
+// 0x36B98C -> XcKeyTable
+// 0x36B990 -> XcDESKeyParity
+// 0x36B994 -> XcRC4Crypt
+// 0x36B998 -> XcRC4Key
+// 0x36B99C -> XcModExp
+// 0x36B9A0 -> XcVerifyPKCS1Signature
+// 0x36B9A4 -> NtDeleteFile
+// 0x36B9A8 -> XePublicKeyData
+// 0x36B9AC -> XboxLANKey
+// 0x36B9B0 -> IofCallDriver
+// 0x36B9B4 -> IoBuildSynchronousFsdRequest
+// 0x36B9B8 -> ObReferenceObjectByName
+// 0x36B9BC -> KeSetTimerEx
+// 0x36B9C0 -> KeQueryPerformanceCounter
+// 0x36B9C4 -> KeQueryPerformanceFrequency
+// 0x36B9C8 -> HalDiskSerialNumber
+// 0x36B9CC -> HalDiskModelNumber
+// 0x36B9D0 -> MmQueryStatistics
+// 0x36B9D4 -> NtSetSystemTime
+// 0x36B9D8 -> MmDeleteKernelStack
+// 0x36B9DC -> MmCreateKernelStack
+// 0x36B9E0 -> RtlUnwind
+// 0x36B9E4 -> KeBugCheck
+// 0x36B9E8 -> IofCompleteRequest
+// 0x36B9EC -> IoSynchronousFsdRequest
+// 0x36B9F0 -> IoSynchronousDeviceIoControlRequest
+// 0x36B9F4 -> IoCreateDevice
+// 0x36B9F8 -> IoInvalidDeviceRequest
+// 0x36B9FC -> IoStartPacket
+// 0x36BA00 -> IoStartNextPacket
+// 0x36BA04 -> IoMarkIrpMustComplete
+// 0x36BA08 -> HalIsResetOrShutdownPending
+
+struct XboxKernelImport {
+    uint32_t thunkAddr;
+    const char* name;
+};
+
+inline XboxKernelImport g_kernelImports[] = {
+    { 0x36B7C0, "XcSHAUpdate" },
+    { 0x36B7C4, "XcSHAInit" },
+    { 0x36B7C8, "XcSHAFinal" },
+    { 0x36B7CC, "XboxHDKey" },
+    { 0x36B7D0, "XboxSignatureKey" },
+    { 0x36B7D4, "XboxAlternateSignatureKeys" },
+    { 0x36B7D8, "ExQueryNonVolatileSetting" },
+    { 0x36B7DC, "KeQuerySystemTime" },
+    { 0x36B7E0, "NtClose" },
+    { 0x36B7E4, "NtQueryVolumeInformationFile" },
+    { 0x36B7E8, "NtOpenFile" },
+    { 0x36B7EC, "RtlInitAnsiString" },
+    { 0x36B7F0, "NtWriteFile" },
+    { 0x36B7F4, "HalDiskCachePartitionCount" },
+    { 0x36B7F8, "NtReadFile" },
+    { 0x36B7FC, "IoCreateSymbolicLink" },
+    { 0x36B800, "NtQuerySymbolicLinkObject" },
+    { 0x36B804, "NtOpenSymbolicLinkObject" },
+    { 0x36B808, "IoDeleteSymbolicLink" },
+    { 0x36B80C, "RtlNtStatusToDosError" },
+    { 0x36B810, "NtFsControlFile" },
+    { 0x36B814, "MmAllocateContiguousMemoryEx" },
+    { 0x36B818, "MmQueryAllocationSize" },
+    { 0x36B81C, "MmSetAddressProtect" },
+    { 0x36B820, "MmFreeContiguousMemory" },
+    { 0x36B824, "MmQueryAddressProtect" },
+    { 0x36B828, "HalBootSMCVideoMode" },
+    { 0x36B82C, "MmPersistContiguousMemory" },
+    { 0x36B830, "MmAllocateContiguousMemory" },
+    { 0x36B834, "LaunchDataPage" },
+    { 0x36B838, "HalReturnToFirmware" },
+    { 0x36B83C, "NtCreateFile" },
+    { 0x36B840, "NtSetInformationFile" },
+    { 0x36B844, "NtQueryInformationFile" },
+    { 0x36B848, "NtWaitForSingleObject" },
+    { 0x36B84C, "NtFlushBuffersFile" },
+    { 0x36B850, "NtDeviceIoControlFile" },
+    { 0x36B854, "ObfDereferenceObject" },
+    { 0x36B858, "ObReferenceObjectByHandle" },
+    { 0x36B85C, "IoFileObjectType" },
+    { 0x36B860, "NtCreateEvent" },
+    { 0x36B864, "ExEventObjectType" },
+    { 0x36B868, "NtSetEvent" },
+    { 0x36B86C, "NtCreateSemaphore" },
+    { 0x36B870, "NtReleaseSemaphore" },
+    { 0x36B874, "NtWaitForSingleObjectEx" },
+    { 0x36B878, "KeDelayExecutionThread" },
+    { 0x36B87C, "RtlLeaveCriticalSection" },
+    { 0x36B880, "RtlEnterCriticalSection" },
+    { 0x36B884, "KeSetBasePriorityThread" },
+    { 0x36B888, "PsThreadObjectType" },
+    { 0x36B88C, "KeQueryBasePriorityThread" },
+    { 0x36B890, "RtlRaiseException" },
+    { 0x36B894, "NtYieldExecution" },
+    { 0x36B898, "PsTerminateSystemThread" },
+    { 0x36B89C, "PsCreateSystemThreadEx" },
+    { 0x36B8A0, "NtDuplicateObject" },
+    { 0x36B8A4, "NtQueryFullAttributesFile" },
+    { 0x36B8A8, "NtQueryDirectoryFile" },
+    { 0x36B8AC, "RtlAnsiStringToUnicodeString" },
+    { 0x36B8B0, "RtlUnicodeStringToAnsiString" },
+    { 0x36B8B4, "KfLowerIrql" },
+    { 0x36B8B8, "KeRaiseIrqlToDpcLevel" },
+    { 0x36B8BC, "RtlTimeToTimeFields" },
+    { 0x36B8C0, "KeTickCount" },
+    { 0x36B8C4, "RtlTimeFieldsToTime" },
+    { 0x36B8C8, "KeSaveFloatingPointState" },
+    { 0x36B8CC, "KeRestoreFloatingPointState" },
+    { 0x36B8D0, "XboxHardwareInfo" },
+    { 0x36B8D4, "HalRegisterShutdownNotification" },
+    { 0x36B8D8, "XeImageFileName" },
+    { 0x36B8DC, "KeInitializeTimerEx" },
+    { 0x36B8E0, "KeSetTimer" },
+    { 0x36B8E4, "KeCancelTimer" },
+    { 0x36B8E8, "KeSetEvent" },
+    { 0x36B8EC, "KeWaitForSingleObject" },
+    { 0x36B8F0, "KeInitializeDpc" },
+    { 0x36B8F4, "XboxKrnlVersion" },
+    { 0x36B8F8, "RtlEqualString" },
+    { 0x36B8FC, "XeLoadSection" },
+    { 0x36B900, "XeUnloadSection" },
+    { 0x36B904, "NtFreeVirtualMemory" },
+    { 0x36B908, "NtAllocateVirtualMemory" },
+    { 0x36B90C, "RtlCompareMemoryUlong" },
+    { 0x36B910, "RtlInitializeCriticalSection" },
+    { 0x36B914, "NtQueryVirtualMemory" },
+    { 0x36B918, "HalInitiateShutdown" },
+    { 0x36B91C, "IdexChannelObject" },
+    { 0x36B920, "XcHMAC" },
+    { 0x36B924, "ExAllocatePoolWithTag" },
+    { 0x36B928, "ExFreePool" },
+    { 0x36B92C, "HalGetInterruptVector" },
+    { 0x36B930, "KfRaiseIrql" },
+    { 0x36B934, "KeConnectInterrupt" },
+    { 0x36B938, "KeInitializeInterrupt" },
+    { 0x36B93C, "KeStallExecutionProcessor" },
+    { 0x36B940, "MmGetPhysicalAddress" },
+    { 0x36B944, "MmLockUnlockBufferPages" },
+    { 0x36B948, "KeInsertQueueDpc" },
+    { 0x36B94C, "MmLockUnlockPhysicalPage" },
+    { 0x36B950, "AvGetSavedDataAddress" },
+    { 0x36B954, "AvSendTVEncoderOption" },
+    { 0x36B958, "AvSetSavedDataAddress" },
+    { 0x36B95C, "AvSetDisplayMode" },
+    { 0x36B960, "KeDisconnectInterrupt" },
+    { 0x36B964, "HalReadWritePCISpace" },
+    { 0x36B968, "MmClaimGpuInstanceMemory" },
+    { 0x36B96C, "DbgPrint" },
+    { 0x36B970, "ExQueryPoolBlockSize" },
+    { 0x36B974, "KeRemoveQueueDpc" },
+    { 0x36B978, "KeSynchronizeExecution" },
+    { 0x36B97C, "PhyGetLinkState" },
+    { 0x36B980, "PhyInitialize" },
+    { 0x36B984, "KeWaitForMultipleObjects" },
+    { 0x36B988, "XcBlockCryptCBC" },
+    { 0x36B98C, "XcKeyTable" },
+    { 0x36B990, "XcDESKeyParity" },
+    { 0x36B994, "XcRC4Crypt" },
+    { 0x36B998, "XcRC4Key" },
+    { 0x36B99C, "XcModExp" },
+    { 0x36B9A0, "XcVerifyPKCS1Signature" },
+    { 0x36B9A4, "NtDeleteFile" },
+    { 0x36B9A8, "XePublicKeyData" },
+    { 0x36B9AC, "XboxLANKey" },
+    { 0x36B9B0, "IofCallDriver" },
+    { 0x36B9B4, "IoBuildSynchronousFsdRequest" },
+    { 0x36B9B8, "ObReferenceObjectByName" },
+    { 0x36B9BC, "KeSetTimerEx" },
+    { 0x36B9C0, "KeQueryPerformanceCounter" },
+    { 0x36B9C4, "KeQueryPerformanceFrequency" },
+    { 0x36B9C8, "HalDiskSerialNumber" },
+    { 0x36B9CC, "HalDiskModelNumber" },
+    { 0x36B9D0, "MmQueryStatistics" },
+    { 0x36B9D4, "NtSetSystemTime" },
+    { 0x36B9D8, "MmDeleteKernelStack" },
+    { 0x36B9DC, "MmCreateKernelStack" },
+    { 0x36B9E0, "RtlUnwind" },
+    { 0x36B9E4, "KeBugCheck" },
+    { 0x36B9E8, "IofCompleteRequest" },
+    { 0x36B9EC, "IoSynchronousFsdRequest" },
+    { 0x36B9F0, "IoSynchronousDeviceIoControlRequest" },
+    { 0x36B9F4, "IoCreateDevice" },
+    { 0x36B9F8, "IoInvalidDeviceRequest" },
+    { 0x36B9FC, "IoStartPacket" },
+    { 0x36BA00, "IoStartNextPacket" },
+    { 0x36BA04, "IoMarkIrpMustComplete" },
+    { 0x36BA08, "HalIsResetOrShutdownPending" },
+    { 0, nullptr }
+};

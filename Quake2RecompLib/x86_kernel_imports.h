@@ -1,0 +1,268 @@
+#pragma once
+#include <cstdint>
+
+// 0xED8D8 -> UnknownKernelExport
+// 0xED898 -> UnknownKernelExport
+// 0xED858 -> MmQueryAllocationSize
+// 0xED8D0 -> UnknownKernelExport
+// 0xED890 -> IoCreateSymbolicLink
+// 0xED850 -> UnknownKernelExport
+// 0xED8C8 -> HalBootSMCVideoMode
+// 0xED888 -> NtOpenFile
+// 0xED848 -> UnknownKernelExport
+// 0xED8C0 -> ExAllocatePool
+// 0xED880 -> MmPersistContiguousMemory
+// 0xED840 -> MmMapIoSpace
+// 0xED8DC -> UnknownKernelExport
+// 0xED89C -> UnknownKernelExport
+// 0xED85C -> NtQueryInformationFile
+// 0xED8D4 -> UnknownKernelExport
+// 0xED894 -> UnknownKernelExport
+// 0xED854 -> HalReadSMCTrayState
+// 0xED8CC -> UnknownKernelExport
+// 0xED88C -> UnknownKernelExport
+// 0xED84C -> MmFreeContiguousMemory
+// 0xED8C4 -> NtOpenSymbolicLinkObject
+// 0xED884 -> NtCreateEvent
+// 0xED844 -> MmAllocateContiguousMemory
+// 0xED8E0 -> UnknownKernelExport
+// 0xED8A0 -> UnknownKernelExport
+// 0xED860 -> NtCreateMutant
+// 0xED8E4 -> UnknownKernelExport
+// 0xED8A4 -> XboxKrnlVersion
+// 0xED864 -> UnknownKernelExport
+// 0xED8E8 -> UnknownKernelExport
+// 0xED8A8 -> XboxHDKey
+// 0xED868 -> UnknownKernelExport
+// 0xED8EC -> UnknownKernelExport
+// 0xED8AC -> UnknownKernelExport
+// 0xED86C -> UnknownKernelExport
+// 0xED8F0 -> UnknownKernelExport
+// 0xED8B0 -> MmSetAddressProtect
+// 0xED870 -> RtlFreeAnsiString
+// 0xED8F4 -> UnknownKernelExport
+// 0xED8B4 -> NtResumeThread
+// 0xED874 -> KeQueryPerformanceCounter
+// 0xED8F8 -> UnknownKernelExport
+// 0xED8B8 -> NtProtectVirtualMemory
+// 0xED878 -> UnknownKernelExport
+// 0xED8FC -> ObOpenObjectByName
+// 0xED8BC -> NtFlushBuffersFile
+// 0xED87C -> UnknownKernelExport
+// 0xED900 -> RtlEnterCriticalSection
+// 0xED904 -> ObDereferenceObject
+// 0xED908 -> NtWriteFileGather
+// 0xED90C -> NtReadFileScatter
+// 0xED910 -> UnknownKernelExport
+// 0xED914 -> NtCreateFile
+// 0xED918 -> XePublicKeyData
+// 0xED91C -> UnknownKernelExport
+// 0xED920 -> UnknownKernelExport
+// 0xED924 -> UnknownKernelExport
+// 0xED928 -> UnknownKernelExport
+// 0xED92C -> UnknownKernelExport
+// 0xED930 -> UnknownKernelExport
+// 0xED934 -> UnknownKernelExport
+// 0xED938 -> NtQueryDirectoryFile
+// 0xED93C -> UnknownKernelExport
+// 0xED940 -> UnknownKernelExport
+// 0xED944 -> UnknownKernelExport
+// 0xED948 -> RtlUnicodeStringToAnsiString
+// 0xED94C -> UnknownKernelExport
+// 0xED950 -> UnknownKernelExport
+// 0xED954 -> UnknownKernelExport
+// 0xED958 -> UnknownKernelExport
+// 0xED95C -> UnknownKernelExport
+// 0xED960 -> UnknownKernelExport
+// 0xED964 -> UnknownKernelExport
+// 0xED968 -> KeQueryPerformanceFrequency
+// 0xED96C -> UnknownKernelExport
+// 0xED970 -> KeInitializeTimerEx
+// 0xED974 -> KeInitializeDpc
+// 0xED978 -> UnknownKernelExport
+// 0xED97C -> UnknownKernelExport
+// 0xED980 -> UnknownKernelExport
+// 0xED984 -> MmAllocateContiguousMemoryEx
+// 0xED988 -> UnknownKernelExport
+// 0xED98C -> UnknownKernelExport
+// 0xED990 -> UnknownKernelExport
+// 0xED994 -> UnknownKernelExport
+// 0xED998 -> UnknownKernelExport
+// 0xED99C -> KeTickCount
+// 0xED9A0 -> UnknownKernelExport
+// 0xED9A4 -> UnknownKernelExport
+// 0xED9A8 -> UnknownKernelExport
+// 0xED9AC -> UnknownKernelExport
+// 0xED9B0 -> UnknownKernelExport
+// 0xED9B4 -> UnknownKernelExport
+// 0xED9B8 -> UnknownKernelExport
+// 0xED9BC -> KeStallExecutionProcessor
+// 0xED9C0 -> KeResumeThread
+// 0xED9C4 -> UnknownKernelExport
+// 0xED9C8 -> UnknownKernelExport
+// 0xED9CC -> UnknownKernelExport
+// 0xED9D0 -> UnknownKernelExport
+// 0xED9D4 -> UnknownKernelExport
+// 0xED9D8 -> UnknownKernelExport
+// 0xED9DC -> UnknownKernelExport
+// 0xED9E0 -> UnknownKernelExport
+// 0xED9E4 -> UnknownKernelExport
+// 0xED9E8 -> UnknownKernelExport
+// 0xED9EC -> UnknownKernelExport
+// 0xED9F0 -> UnknownKernelExport
+// 0xED9F4 -> UnknownKernelExport
+// 0xED9F8 -> UnknownKernelExport
+// 0xED9FC -> RtlInitUnicodeString
+// 0xEDA00 -> KeAlertResumeThread
+// 0xEDA04 -> ObOpenObjectByPointer
+// 0xEDA08 -> UnknownKernelExport
+// 0xEDA0C -> KeWaitForSingleObject
+// 0xEDA10 -> UnknownKernelExport
+// 0xEDA14 -> AvGetSavedDataAddress
+// 0xEDA18 -> AvSendTVEncoderOption
+// 0xEDA1C -> AvSetSavedDataAddress
+// 0xEDA20 -> AvSetDisplayMode
+// 0xEDA24 -> UnknownKernelExport
+// 0xEDA28 -> UnknownKernelExport
+// 0xEDA2C -> UnknownKernelExport
+// 0xEDA30 -> UnknownKernelExport
+// 0xEDA34 -> UnknownKernelExport
+// 0xEDA38 -> UnknownKernelExport
+// 0xEDA3C -> UnknownKernelExport
+
+struct XboxKernelImport {
+    uint32_t thunkAddr;
+    const char* name;
+};
+
+inline XboxKernelImport g_kernelImports[] = {
+    { 0xED8D8, "UnknownKernelExport" },
+    { 0xED898, "UnknownKernelExport" },
+    { 0xED858, "MmQueryAllocationSize" },
+    { 0xED8D0, "UnknownKernelExport" },
+    { 0xED890, "IoCreateSymbolicLink" },
+    { 0xED850, "UnknownKernelExport" },
+    { 0xED8C8, "HalBootSMCVideoMode" },
+    { 0xED888, "NtOpenFile" },
+    { 0xED848, "UnknownKernelExport" },
+    { 0xED8C0, "ExAllocatePool" },
+    { 0xED880, "MmPersistContiguousMemory" },
+    { 0xED840, "MmMapIoSpace" },
+    { 0xED8DC, "UnknownKernelExport" },
+    { 0xED89C, "UnknownKernelExport" },
+    { 0xED85C, "NtQueryInformationFile" },
+    { 0xED8D4, "UnknownKernelExport" },
+    { 0xED894, "UnknownKernelExport" },
+    { 0xED854, "HalReadSMCTrayState" },
+    { 0xED8CC, "UnknownKernelExport" },
+    { 0xED88C, "UnknownKernelExport" },
+    { 0xED84C, "MmFreeContiguousMemory" },
+    { 0xED8C4, "NtOpenSymbolicLinkObject" },
+    { 0xED884, "NtCreateEvent" },
+    { 0xED844, "MmAllocateContiguousMemory" },
+    { 0xED8E0, "UnknownKernelExport" },
+    { 0xED8A0, "UnknownKernelExport" },
+    { 0xED860, "NtCreateMutant" },
+    { 0xED8E4, "UnknownKernelExport" },
+    { 0xED8A4, "XboxKrnlVersion" },
+    { 0xED864, "UnknownKernelExport" },
+    { 0xED8E8, "UnknownKernelExport" },
+    { 0xED8A8, "XboxHDKey" },
+    { 0xED868, "UnknownKernelExport" },
+    { 0xED8EC, "UnknownKernelExport" },
+    { 0xED8AC, "UnknownKernelExport" },
+    { 0xED86C, "UnknownKernelExport" },
+    { 0xED8F0, "UnknownKernelExport" },
+    { 0xED8B0, "MmSetAddressProtect" },
+    { 0xED870, "RtlFreeAnsiString" },
+    { 0xED8F4, "UnknownKernelExport" },
+    { 0xED8B4, "NtResumeThread" },
+    { 0xED874, "KeQueryPerformanceCounter" },
+    { 0xED8F8, "UnknownKernelExport" },
+    { 0xED8B8, "NtProtectVirtualMemory" },
+    { 0xED878, "UnknownKernelExport" },
+    { 0xED8FC, "ObOpenObjectByName" },
+    { 0xED8BC, "NtFlushBuffersFile" },
+    { 0xED87C, "UnknownKernelExport" },
+    { 0xED900, "RtlEnterCriticalSection" },
+    { 0xED904, "ObDereferenceObject" },
+    { 0xED908, "NtWriteFileGather" },
+    { 0xED90C, "NtReadFileScatter" },
+    { 0xED910, "UnknownKernelExport" },
+    { 0xED914, "NtCreateFile" },
+    { 0xED918, "XePublicKeyData" },
+    { 0xED91C, "UnknownKernelExport" },
+    { 0xED920, "UnknownKernelExport" },
+    { 0xED924, "UnknownKernelExport" },
+    { 0xED928, "UnknownKernelExport" },
+    { 0xED92C, "UnknownKernelExport" },
+    { 0xED930, "UnknownKernelExport" },
+    { 0xED934, "UnknownKernelExport" },
+    { 0xED938, "NtQueryDirectoryFile" },
+    { 0xED93C, "UnknownKernelExport" },
+    { 0xED940, "UnknownKernelExport" },
+    { 0xED944, "UnknownKernelExport" },
+    { 0xED948, "RtlUnicodeStringToAnsiString" },
+    { 0xED94C, "UnknownKernelExport" },
+    { 0xED950, "UnknownKernelExport" },
+    { 0xED954, "UnknownKernelExport" },
+    { 0xED958, "UnknownKernelExport" },
+    { 0xED95C, "UnknownKernelExport" },
+    { 0xED960, "UnknownKernelExport" },
+    { 0xED964, "UnknownKernelExport" },
+    { 0xED968, "KeQueryPerformanceFrequency" },
+    { 0xED96C, "UnknownKernelExport" },
+    { 0xED970, "KeInitializeTimerEx" },
+    { 0xED974, "KeInitializeDpc" },
+    { 0xED978, "UnknownKernelExport" },
+    { 0xED97C, "UnknownKernelExport" },
+    { 0xED980, "UnknownKernelExport" },
+    { 0xED984, "MmAllocateContiguousMemoryEx" },
+    { 0xED988, "UnknownKernelExport" },
+    { 0xED98C, "UnknownKernelExport" },
+    { 0xED990, "UnknownKernelExport" },
+    { 0xED994, "UnknownKernelExport" },
+    { 0xED998, "UnknownKernelExport" },
+    { 0xED99C, "KeTickCount" },
+    { 0xED9A0, "UnknownKernelExport" },
+    { 0xED9A4, "UnknownKernelExport" },
+    { 0xED9A8, "UnknownKernelExport" },
+    { 0xED9AC, "UnknownKernelExport" },
+    { 0xED9B0, "UnknownKernelExport" },
+    { 0xED9B4, "UnknownKernelExport" },
+    { 0xED9B8, "UnknownKernelExport" },
+    { 0xED9BC, "KeStallExecutionProcessor" },
+    { 0xED9C0, "KeResumeThread" },
+    { 0xED9C4, "UnknownKernelExport" },
+    { 0xED9C8, "UnknownKernelExport" },
+    { 0xED9CC, "UnknownKernelExport" },
+    { 0xED9D0, "UnknownKernelExport" },
+    { 0xED9D4, "UnknownKernelExport" },
+    { 0xED9D8, "UnknownKernelExport" },
+    { 0xED9DC, "UnknownKernelExport" },
+    { 0xED9E0, "UnknownKernelExport" },
+    { 0xED9E4, "UnknownKernelExport" },
+    { 0xED9E8, "UnknownKernelExport" },
+    { 0xED9EC, "UnknownKernelExport" },
+    { 0xED9F0, "UnknownKernelExport" },
+    { 0xED9F4, "UnknownKernelExport" },
+    { 0xED9F8, "UnknownKernelExport" },
+    { 0xED9FC, "RtlInitUnicodeString" },
+    { 0xEDA00, "KeAlertResumeThread" },
+    { 0xEDA04, "ObOpenObjectByPointer" },
+    { 0xEDA08, "UnknownKernelExport" },
+    { 0xEDA0C, "KeWaitForSingleObject" },
+    { 0xEDA10, "UnknownKernelExport" },
+    { 0xEDA14, "AvGetSavedDataAddress" },
+    { 0xEDA18, "AvSendTVEncoderOption" },
+    { 0xEDA1C, "AvSetSavedDataAddress" },
+    { 0xEDA20, "AvSetDisplayMode" },
+    { 0xEDA24, "UnknownKernelExport" },
+    { 0xEDA28, "UnknownKernelExport" },
+    { 0xEDA2C, "UnknownKernelExport" },
+    { 0xEDA30, "UnknownKernelExport" },
+    { 0xEDA34, "UnknownKernelExport" },
+    { 0xEDA38, "UnknownKernelExport" },
+    { 0xEDA3C, "UnknownKernelExport" },
+    { 0, nullptr }
+};
