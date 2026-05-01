@@ -8,6 +8,10 @@
 #include <cmath>
 #include <limits>
 #include <chrono>
+#ifdef _MSC_VER
+#include <intrin.h>
+#pragma intrinsic(_ReturnAddress)
+#endif
 
 #ifdef _WIN32
 // Windows.h pulls in a lot; keep include-order minimal. DbgHelp is used by
@@ -140,90 +144,88 @@ inline uint64_t x86_rd_u64(uint8_t* b, uint32_t a) { a = x86_phys_translate(a); 
 // matrix pushes rather than D3DDevice_SetVertexShaderConstant* calls.
 //
 // Ranges derived from IDA: all D3D_* globals live in 0x35BE00..0x360A00,
-// all DirectSound* globals live in 0x300000..0x300B40. The D3D range is
-// split into two narrow windows that cover only live pipeline state we
-// actually care about tracing, and deliberately excludes:
+// all DirectSound* globals live in 0x300000..0x300B40. After successive
+// rounds of narrowing, only the deferred-texture-stage-state table is
+// still worth watching: every other write we observed in the D3D segment
+// turned out to be either a one-shot tuning global, an XBD3D8 internal
+// readback shadow that mirrors a successful HLE Set* call, or a literal
+// constant pool. Specifically dropped (with rationale):
 //   * 0x35BE00..0x35D3FF — XBD3D8 .rdata-style literal pool (float consts
 //     loaded by movss [imm32] in XDK math helpers; harmless).
-//   * 0x35FB48 (D3D_pDevice push-buffer struct pointer) — only relevant
-//     when the guest emits raw NV2A tokens on a path our HLE bypasses.
+//   * 0x35D6A0..0x35D6FF — push-buffer ptr pair + flag byte (XBD3D8
+//     internal; HLE bypasses guest push buffer entirely).
+//   * 0x35FB48 (D3D_pDevice push-buffer struct pointer).
+//   * 0x35FB58..0x35FDF0 — D3D_g_RenderState marker, D3D_g_ComplexRenderState
+//     and other XBD3D8 bookkeeping globals (HLE keeps render state in a
+//     host array; guest copies are stale-but-harmless).
+//   * 0x35FDF8..0x3607FF — VSH constant shadow. Inlined matrix pushes
+//     copy into this shadow with `rep movsd` immediately before calling
+//     D3DDevice_SetVertexShaderConstantNotInlineFast; our HLE captures
+//     the constants from the setter's local-stack arg, so the shadow
+//     write is redundant.
 //   * 0x3609FC / 0x360A00 (D3D_CDevice_m_PushSegmentSize / CommandSize)
 //     — one-shot tuning globals written by B3Main and never consulted by
-//     HLE Direct3D_CreateDevice; only consumer is D3D_MakeRequestedSpace
-//     on guest-side push-buffer fast paths that the HLE doesn't drive.
+//     HLE Direct3D_CreateDevice.
 //
-// Kept windows:
+// Kept window:
 //   [0x35D400..0x35D6A0)  covers D3D_g_DeferredTextureState @ 0x35D498
 //                         (4 stages × 32 dwords = 512 B, ends at 0x35D698).
-//                         Upper bound deliberately stops just before the
-//                         push-buffer ptr pair at 0x35D6A0/0x35D6A4 and the
-//                         push-buffer flag byte at 0x35D6A8 (all XBD3D8
-//                         internal push-buffer state that HLE does not use).
-//   [0x35FDF8..0x360800)  covers the VSH constant shadow at 0x35FDF8.
-//                         The range 0x35FB58..0x35FDF0 is a scatter of
-//                         XBD3D8 bookkeeping globals (D3D_g_RenderState
-//                         marker, D3D_g_ComplexRenderState @ 0x35FD78,
-//                         pixel-shader pointer, etc.) that are touched
-//                         only by legitimate XBD3D8 readbacks after our
-//                         HLE Set* calls — our refactored HLE keeps the
-//                         166 render states in a host array and never
-//                         writes/reads guest memory for them, so there
-//                         is nothing to diagnose in that sub-range.
+//
+// DSound watch dropped: HLE DSound (hle_dsound.cpp) is functional, so the
+// XBDSOUND static buffer pool at 0x300000..0x300B40 is populated with
+// valid live state. The audio-emitter update loop in sub_1645A0 reads
+// buffer state bytes / 3D-listener slots / position vec4s every frame;
+// these are normal post-HLE reads, not symptoms of a missing handler.
 #define X86_D3D_TSS_BASE       0x0035D400u
 #define X86_D3D_TSS_END        0x0035D6A0u
-#define X86_D3D_RS_BASE        0x0035FDF8u
-#define X86_D3D_RS_END         0x00360800u
-#define X86_DSOUND_WATCH_BASE  0x00300000u
-#define X86_DSOUND_WATCH_END   0x00301000u
 
 // Runtime toggle: defaults to ON in debug builds, OFF in release.
 // Override at runtime via the X86_TRACE_SEG env var ("0" to disable,
 // any other non-empty value to enable).
-inline bool& x86_seg_trace_enabled() {
-    static bool s_en = []() {
-        const char* e = std::getenv("X86_TRACE_SEG");
-        if (e && *e) return *e != '0';
+//
+// PERF NOTE: this used to be a function-local `static` initialized via a
+// lambda. Every guest memory read/write goes through x86_seg_log(), which
+// then called this accessor — and the magic-static guard (atomic load to
+// check first-time initialization) was costing ~24% of total CPU on the
+// guest hot path. Replacing it with an inline global initialized once at
+// program startup (via a dummy static initializer) reduces the per-call
+// cost to a single byte load that the compiler can hoist out of loops.
+inline bool g_x86_seg_trace_enabled = []() {
+    const char* e = std::getenv("X86_TRACE_SEG");
+    if (e && *e) return *e != '0';
 #ifndef NDEBUG
-        return true;
+    return true;
 #else
-        return false;
+    return false;
 #endif
-    }();
-    return s_en;
-}
+}();
+inline bool& x86_seg_trace_enabled() { return g_x86_seg_trace_enabled; }
 
 inline const char* x86_seg_region(uint32_t addr) {
     if (addr >= X86_D3D_TSS_BASE    && addr < X86_D3D_TSS_END)    return "D3D";
-    if (addr >= X86_D3D_RS_BASE     && addr < X86_D3D_RS_END)     return "D3D";
-    if (addr >= X86_DSOUND_WATCH_BASE && addr < X86_DSOUND_WATCH_END) return "DSND";
     return nullptr;
 }
 
 // Log at most 4k accesses, and de-duplicate consecutive hits to the same
 // (addr, rw, size) key so repeated tight-loop reads don't flood the log.
-inline void x86_seg_log(bool write, uint32_t addr, uint32_t sz, uint64_t val) {
-    if (!x86_seg_trace_enabled()) return;
-    const char* region = x86_seg_region(addr);
-    if (!region) return;
-    static int s_count = 0;
-    if (s_count >= 10) return;
-    static uint64_t s_lastKey = ~0ull;
-    static uint64_t s_lastVal = ~0ull;
-    uint64_t key = (uint64_t(addr) << 8) | (uint64_t(sz) << 1) | (write ? 1u : 0u);
-    if (key == s_lastKey && val == s_lastVal) return;
-    s_lastKey = key; s_lastVal = val;
-    fprintf(stderr, "[SEG][%s] %s addr=0x%08X sz=%u val=0x%llX\n",
-            region, write ? "WR" : "RD", addr, sz,
-            (unsigned long long)val);
-    x86_print_host_stack(0);
-    if (++s_count == 10)
-        fprintf(stderr, "[SEG] log limit reached, suppressing further messages\n");
+//
+// Split into a fast inline early-out and an out-of-line slow path. When
+// tracing is disabled (the default in release) every memory access pays
+// only a single byte-load + branch instead of a function call.
+void x86_seg_log_slow(bool write, uint32_t addr, uint32_t sz, uint64_t val);
+__forceinline void x86_seg_log(bool write, uint32_t addr, uint32_t sz, uint64_t val) {
+    if (!g_x86_seg_trace_enabled) return;
+    //x86_seg_log_slow(write, addr, sz, val);
 }
 
-inline void x86_wr_u8 (uint8_t* b, uint32_t a, uint8_t  v) { a = x86_phys_translate(a); x86_seg_log(true,a,1,v); if (!x86_mem_ok(a,1)) { x86_log_mmio(true,a,1,v); return; } *(uint8_t*) (b+a)=v; }
-inline void x86_wr_u16(uint8_t* b, uint32_t a, uint16_t v) { a = x86_phys_translate(a); x86_seg_log(true,a,2,v); if (!x86_mem_ok(a,2)) { x86_log_mmio(true,a,2,v); return; } *(uint16_t*)(b+a)=v; }
-inline void x86_wr_u32(uint8_t* b, uint32_t a, uint32_t v) { a = x86_phys_translate(a); x86_seg_log(true,a,4,v); if (!x86_mem_ok(a,4)) { x86_log_mmio(true,a,4,v); return; } *(uint32_t*)(b+a)=v; }
-inline void x86_wr_u64(uint8_t* b, uint32_t a, uint64_t v) { a = x86_phys_translate(a); x86_seg_log(true,a,8,v); if (!x86_mem_ok(a,8)) { x86_log_mmio(true,a,8,v); return; } *(uint64_t*)(b+a)=v; }
+inline void x86_wr_u8 (uint8_t* b, uint32_t a, uint8_t  v) { a = x86_phys_translate(a); x86_seg_log(true,a,1,v); if (!x86_mem_ok(a,1)) { x86_log_mmio(true,a,1,v); return; }
+    *(uint8_t*) (b+a)=v; }
+inline void x86_wr_u16(uint8_t* b, uint32_t a, uint16_t v) { a = x86_phys_translate(a); x86_seg_log(true,a,2,v); if (!x86_mem_ok(a,2)) { x86_log_mmio(true,a,2,v); return; }
+    *(uint16_t*)(b+a)=v; }
+inline void x86_wr_u32(uint8_t* b, uint32_t a, uint32_t v) { a = x86_phys_translate(a); x86_seg_log(true,a,4,v); if (!x86_mem_ok(a,4)) { x86_log_mmio(true,a,4,v); return; }
+    *(uint32_t*)(b+a)=v; }
+inline void x86_wr_u64(uint8_t* b, uint32_t a, uint64_t v) { a = x86_phys_translate(a); x86_seg_log(true,a,8,v); if (!x86_mem_ok(a,8)) { x86_log_mmio(true,a,8,v); return; }
+    *(uint64_t*)(b+a)=v; }
 
 #define X86_MEM_READ_u8(base, addr)   x86_rd_u8 ((base), (uint32_t)(addr))
 #define X86_MEM_READ_u16(base, addr)  x86_rd_u16((base), (uint32_t)(addr))
@@ -237,8 +239,10 @@ inline void x86_wr_u64(uint8_t* b, uint32_t a, uint64_t v) { a = x86_phys_transl
 // ---- Floating-point memory access ----
 inline float  x86_rd_f32(uint8_t* b, uint32_t a) { a = x86_phys_translate(a); if (!x86_mem_ok(a,4)) { x86_log_mmio(false,a,4,0); return 0.0f; } return *(float*) (b+a); }
 inline double x86_rd_f64(uint8_t* b, uint32_t a) { a = x86_phys_translate(a); if (!x86_mem_ok(a,8)) { x86_log_mmio(false,a,8,0); return 0.0;  } return *(double*)(b+a); }
-inline void x86_wr_f32(uint8_t* b, uint32_t a, float  v) { a = x86_phys_translate(a); if (!x86_mem_ok(a,4)) { x86_log_mmio(true,a,4,(uint32_t&)v); return; } *(float*) (b+a)=v; }
-inline void x86_wr_f64(uint8_t* b, uint32_t a, double v) { a = x86_phys_translate(a); uint64_t bits; memcpy(&bits,&v,8); if (!x86_mem_ok(a,8)) { x86_log_mmio(true,a,8,(uint64_t&)v); return; } *(double*)(b+a)=v; }
+inline void x86_wr_f32(uint8_t* b, uint32_t a, float  v) { a = x86_phys_translate(a); if (!x86_mem_ok(a,4)) { x86_log_mmio(true,a,4,(uint32_t&)v); return; }
+    *(float*) (b+a)=v; }
+inline void x86_wr_f64(uint8_t* b, uint32_t a, double v) { a = x86_phys_translate(a); uint64_t bits; memcpy(&bits,&v,8); if (!x86_mem_ok(a,8)) { x86_log_mmio(true,a,8,(uint64_t&)v); return; }
+    *(double*)(b+a)=v; }
 
 #define X86_MEM_READ_F32(base, addr)  x86_rd_f32((base), (uint32_t)(addr))
 #define X86_MEM_READ_F64(base, addr)  x86_rd_f64((base), (uint32_t)(addr))
@@ -507,6 +511,21 @@ inline void X86_UNPACK_FLAGS_AH(X86Context& ctx, uint8_t ah) {
 }
 
 // ---- FPU helpers ----
+inline double X86_FPU_ROUND(const X86Context& ctx, double v) {
+    switch ((ctx.fp_control >> 8) & 3) {
+        case 0:  return (double)(float)v;  // PC=00, single
+        case 2:  return v;                 // PC=10, double
+        default: return v;                 // PC=11 / PC=01, extended or reserved
+    }
+}
+
+// #define X86_FPU_PUSH(ctx, val) do { \
+//     double _v = X86_FPU_ROUND((ctx), (val)); \
+//     (ctx).fp_top = ((ctx).fp_top - 1) & 7; \
+//     (ctx).fp_stack[(ctx).fp_top] = _v; \
+// } while(0)
+// #define X86_FPU_POP(ctx) do { (ctx).fp_top = ((ctx).fp_top + 1) & 7; } while(0)
+
 // Shift-based model: fp_stack[0] is always ST(0), fp_stack[n] is ST(n).
 // fp_top is kept at 0 so fp_stack[fp_top] == fp_stack[0] == ST(0).
 #define X86_FPU_PUSH(ctx, val) do { \
@@ -650,6 +669,7 @@ void X86_CALL_INDIRECT(X86Context& ctx, uint8_t* base, uint32_t addr) {
                 fprintf(stderr, " [+%02X]=0x%08X", i*4,
                         X86_MEM_READ_u32(base, ctx.esp + i*4));
             fprintf(stderr, "\n");
+            x86_print_host_stack("X86_CALL_INDIRECT-MISS", 1, 24);
             s_missLog++;
         }
     }

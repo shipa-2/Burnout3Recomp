@@ -62,6 +62,8 @@ struct GuestThread final : KernelObject
 
         // Allocate stack from guest heap.
         stackBase = g_heap.AllocGuestAligned(stackSize, 4096);
+        fprintf(stderr, "[GuestThread] alloc stack: base=0x%08X size=0x%X top=0x%08X start=0x%08X\n",
+                stackBase, stackSize, stackBase + stackSize - 16, p.startAddress);
 
         // Launch the host thread.
         thread = std::thread(&GuestThread::ThreadEntry, this);

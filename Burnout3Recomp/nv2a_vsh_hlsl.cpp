@@ -187,6 +187,29 @@ static std::string writemask_letters(uint32_t mask) {
     return out;
 }
 
+// Fog register special-case writemask (mirrors Xemu fog_mask_str[]).
+// NV2A writes to oFog always put the most-significant masked component into
+// oFog.x so the PSH can reliably read the fog factor from oFog.x.
+// Index is the raw 4-bit FLD_OUT_O_MASK value (bit3=x, bit2=y, bit1=z, bit0=w).
+static const char* fog_mask_letters[16] = {
+    "x",    // 0000 (empty → default x so fog.x gets something)
+    "x",    // 0001 ___w → x
+    "x",    // 0010 __z_ → x
+    "xy",   // 0011 __zw → xy
+    "x",    // 0100 _y__ → x
+    "xy",   // 0101 _y_w → xy
+    "xy",   // 0110 _yz_ → xy
+    "xyz",  // 0111 _yzw → xyz
+    "x",    // 1000 x___ → x
+    "xy",   // 1001 x__w → xy
+    "xy",   // 1010 x_z_ → xy
+    "xyz",  // 1011 x_zw → xyz
+    "xy",   // 1100 xy__ → xy
+    "xyz",  // 1101 xy_w → xyz
+    "xyz",  // 1110 xyz_ → xyz
+    "xyzw", // 1111
+};
+
 static std::string decode_opcode_input(const uint32_t* tok,
                                        VshParameterType param,
                                        VshFieldName neg_field,
@@ -274,6 +297,7 @@ static std::string decode_opcode(const uint32_t* tok,
         && vsh_get(tok, FLD_OUT_O_MASK) != 0) {
 
         std::string dst;
+        bool isFogReg = false;
         if ((VshOutputType)vsh_get(tok, FLD_OUT_ORB) == OUTPUT_C) {
             // Writable const register — not emulated. Route to a scratch to
             // avoid HLSL errors; the cbuffer `c[]` can't be written.
@@ -282,10 +306,16 @@ static std::string decode_opcode(const uint32_t* tok,
             int oidx = vsh_get(tok, FLD_OUT_ADDRESS) & 0xF;
             const char* nm = out_local_name(oidx);
             dst = nm ? nm : "R0";
+            isFogReg = (oidx == 5); // OUTPUT_REG_FOG
         }
-        std::string m = writemask_letters(vsh_get(tok, FLD_OUT_O_MASK));
-        ret << "  " << opcode_name << "(" << dst << ", " << m
-            << inputs << ");\n";
+        // For oFog writes, NV2A always routes the most-significant masked
+        // component to oFog.x so the PSH can read fog.x reliably.
+        uint32_t omask = vsh_get(tok, FLD_OUT_O_MASK);
+        std::string m = isFogReg ? std::string(fog_mask_letters[omask & 0xF])
+                                 : writemask_letters(omask);
+        if (!m.empty())
+            ret << "  " << opcode_name << "(" << dst << ", " << m
+                << inputs << ");\n";
     }
 
     return ret.str();
@@ -688,6 +718,18 @@ Nv2aVsResult TranslateNV2AtoHLSL(const uint32_t* funcTokens, size_t funcBytes,
     // local and we copy into SV_Position at the end.
     hlsl << "    float4 oPos=float4(0,0,0,0);\n";
     hlsl << "    #define R12 oPos // Xbox R12 is aliased with oPos\n";
+    // Default values for unwritten outputs.
+    //   oD0 = (1,1,1,1)   B3 map shaders don't write diffuse and expect a
+    //                     fully-lit passthrough (matches Xbox FF "no
+    //                     material" behaviour). Setting (0,0,0,1) here
+    //                     turns the entire map black.
+    //   oFog= (1,1,1,1)   Same story: many B3 PS combiners multiply by
+    //                     vFog and expect 1.0 when the VS doesn't write
+    //                     fog. Setting (0,0,0,1) blacks out maps.
+    //   oD1 = (0,0,0,0)   Specular zero (matches Xemu).
+    // Until we plumb vertex DIFFUSE/SPECULAR/FOG passthrough properly
+    // (auto-binding vReg[3] -> oD0 when the VS body doesn't write it),
+    // keep these "fully on" defaults.
     hlsl << "    float4 oD0=float4(1,1,1,1), oD1=float4(0,0,0,0), oFog=float4(1,1,1,1);\n";
     hlsl << "    float4 oPts=float4(0,0,0,0), oB0=float4(0,0,0,0), oB1=float4(0,0,0,0);\n";
     // Xbox convention: unwritten VS output components default to (0,0,0,1).

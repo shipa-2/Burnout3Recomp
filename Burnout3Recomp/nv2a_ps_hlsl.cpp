@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 
 namespace Nv2aPsHlsl {
 namespace {
@@ -266,8 +267,14 @@ static std::string EmitInput(const InputReg& in, bool asAlphaScalar, bool isFina
     switch (in.inputMapping) {
         case IM_UNSIGNED_IDENTITY:
             if (isZero) return asAlphaScalar ? std::string("0.0") : std::string("float3(0,0,0)");
-            // Final combiner: |x| (abs).  Combiners: saturate(x).
-            std::snprintf(buf, sizeof(buf), "%s(%s)", isFinal ? "abs" : "saturate", src.c_str());
+            // NV2A IM_UNSIGNED_IDENTITY clamps the input to >= 0 (negatives
+            // become zero). Both stages and the final combiner share this
+            // semantic; Xemu (psh.c) emits max(x, 0.0) in both cases. Our
+            // previous abs() in the final combiner flipped negative
+            // specular lobes back to positive, doubling highlights on
+            // metallic surfaces.
+            std::snprintf(buf, sizeof(buf), "max(%s, %s)", src.c_str(),
+                          asAlphaScalar ? "0.0" : "float3(0,0,0)");
             return buf;
         case IM_UNSIGNED_INVERT:
             if (isZero) return asAlphaScalar ? std::string("1.0") : std::string("float3(1,1,1)");
@@ -394,7 +401,10 @@ static void EmitChannel(std::stringstream& out, const CombChan& c, bool isRGB, i
 }
 
 // Emit a texture-stage fetch into tN.
+// input_tex[stage] = which prior stage's output to use for dependent reads (-1 if none).
+// dot_map[stage]   = dotmap function index (0..7) for dot-product modes.
 static void EmitTextureStage(std::stringstream& out, unsigned stage, uint8_t mode,
+                             const int input_tex[4], const int dot_map[4],
                              Result& r) {
     const char* tN = nullptr;
     switch (stage) {
@@ -438,10 +448,18 @@ static void EmitTextureStage(std::stringstream& out, unsigned stage, uint8_t mod
             r.samplesStage[stage] = true;
             break;
         case PS_TM_CUBEMAP:
-            // Emit as 2D sample of xy (games using cubemaps for reflection
-            // will look approximate but not black).
+        // NV2A "dot-product reflect" modes: final stage of a 3-stage
+        // chain that builds a reflection/normal vector and samples a
+        // cubemap. The VS typically pre-writes the reflection vector
+        // into oT.xyz of this stage, so as an approximation we sample
+        // the cube directly using oT.xyz (matches what most Xbox
+        // titles including Burnout 3 set up).
+        case PS_TM_DOT_RFLCT_DIFF:       // 0x0B
+        case PS_TM_DOT_RFLCT_SPEC:       // 0x0C
+        case PS_TM_DOT_STR_CUBE:         // 0x0E
+        case PS_TM_DOT_RFLCT_SPEC_CONST: // 0x12
             out << "    " << tN << " = " << tex2d << ".Sample(" << samp
-                << ", " << inT << ".xy);\n";
+                << ", " << inT << ".xyz);\n";
             r.usesStage[stage] = true;
             r.samplesStage[stage] = true;
             break;
@@ -449,9 +467,105 @@ static void EmitTextureStage(std::stringstream& out, unsigned stage, uint8_t mod
             out << "    " << tN << " = " << inT << ";\n";
             r.usesStage[stage] = true;
             break;
+        case PS_TM_CLIPPLANE: {
+            // Discard the pixel if any of the texture coordinate components
+            // fail the clip test. PSCompareMode[stage][j] = 1 means ">= 0"
+            // passes; 0 means "< 0" passes. We use the conservative approach
+            // of discarding outside the range [0, 1] for all components since
+            // we don't plumb PSCompareMode through yet.
+            out << "    " << tN << " = float4(0,0,0,0);\n";
+            out << "    if (" << inT << ".x < 0.0 || " << inT << ".y < 0.0 || "
+                << inT << ".z < 0.0 || " << inT << ".w < 0.0) discard;\n";
+            r.usesStage[stage] = true;
+            break;
+        }
+        case PS_TM_BUMPENVMAP:
+        case PS_TM_BUMPENVMAP_LUM: {
+            // Bump-environment mapping: read signed (ds,dt) offset from a
+            // prior stage's texture (input_tex[stage]), apply the bump
+            // environment matrix, then add to this stage's UV and sample.
+            // We don't have the bumpMat cbuffer hooked up yet, so we use
+            // an identity transform (ds,dt passed through unchanged). This
+            // gives incorrect scale/rotation but at least samples the bumped
+            // region of the texture rather than the unbumped UV.
+            int src = (stage < 4 && input_tex[stage] >= 0) ? input_tex[stage] : 0;
+            // Source texture names t0..t3
+            const char* srcNames[4] = {"t0","t1","t2","t3"};
+            const char* srcT = srcNames[src < 4 ? src : 0];
+            // sign3: convert unsigned [0,1] float8 → signed [-1,1] (NV2A BUMPENVMAP convention)
+            // ds from .b channel, dt from .g channel
+            out << "    {\n";
+            out << "        float2 _dsdt = float2(\n"
+                << "            (" << srcT << ".b * 255.0 >= 128.0 ? (" << srcT << ".b * 255.0 - 256.0) / 127.0 : " << srcT << ".b * 255.0 / 127.0),\n"
+                << "            (" << srcT << ".g * 255.0 >= 128.0 ? (" << srcT << ".g * 255.0 - 256.0) / 127.0 : " << srcT << ".g * 255.0 / 127.0));\n";
+            out << "        " << tN << " = " << tex2d << ".Sample(" << samp
+                << ", " << inT << ".xy + _dsdt);\n";
+            if (mode == PS_TM_BUMPENVMAP_LUM) {
+                // Luminance modulation: t *= (bumpScale * lum + bumpOffset)
+                // Without uniforms, skip the scale (leave as is).
+                // A proper implementation needs bumpScale[stage]/bumpOffset[stage].
+            }
+            out << "    }\n";
+            r.usesStage[stage] = true;
+            r.samplesStage[stage] = true;
+            break;
+        }
+        case PS_TM_DPNDNT_AR: {
+            // Dependent texture read using alpha + red channels from input stage.
+            int src = (stage < 4 && input_tex[stage] >= 0) ? input_tex[stage] : 0;
+            const char* srcNames[4] = {"t0","t1","t2","t3"};
+            const char* srcT = srcNames[src < 4 ? src : 0];
+            out << "    " << tN << " = " << tex2d << ".Sample(" << samp
+                << ", " << srcT << ".ar);\n";
+            r.usesStage[stage] = true;
+            r.samplesStage[stage] = true;
+            break;
+        }
+        case PS_TM_DPNDNT_GB: {
+            // Dependent texture read using green + blue channels from input stage.
+            int src = (stage < 4 && input_tex[stage] >= 0) ? input_tex[stage] : 0;
+            const char* srcNames[4] = {"t0","t1","t2","t3"};
+            const char* srcT = srcNames[src < 4 ? src : 0];
+            out << "    " << tN << " = " << tex2d << ".Sample(" << samp
+                << ", " << srcT << ".gb);\n";
+            r.usesStage[stage] = true;
+            r.samplesStage[stage] = true;
+            break;
+        }
+        case PS_TM_DOT_ST: {
+            // Dot-product of texture coordinate with input normal-map texel.
+            // Contributes one component to a multi-stage chain; sample this stage.
+            int src = (stage < 4 && input_tex[stage] >= 0) ? input_tex[stage] : 0;
+            const char* srcNames[4] = {"t0","t1","t2","t3"};
+            const char* srcT = srcNames[src < 4 ? src : 0];
+            // Compute dot product of pT.xyz with the decoded normal.
+            out << "    {\n";
+            out << "        float _dot" << stage << " = dot(" << inT << ".xyz, " << srcT << ".rgb * 2.0 - 1.0);\n";
+            out << "        float2 _dotST = float2(_dot" << stage << ", _dot" << (stage > 0 ? stage-1 : 0) << ");\n";
+            out << "        " << tN << " = " << tex2d << ".Sample(" << samp << ", _dotST);\n";
+            out << "    }\n";
+            r.usesStage[stage] = true;
+            r.samplesStage[stage] = true;
+            break;
+        }
+        case PS_TM_DOT_ZW:
+        case PS_TM_DOTPRODUCT: {
+            // Dot-product stages that don't sample (contribute to later stages).
+            out << "    " << tN << " = float4(0,0,0,0);\n";
+            r.usesStage[stage] = true;
+            break;
+        }
+        case PS_TM_DOT_STR_3D: {
+            // 3-stage dot product chain → 3D texture lookup. Approximate as 2D.
+            out << "    " << tN << " = " << tex2d << ".Sample(" << samp
+                << ", " << inT << ".xy / max(" << inT << ".w, 1e-6));\n";
+            r.usesStage[stage] = true;
+            r.samplesStage[stage] = true;
+            break;
+        }
+        case PS_TM_BRDF:
         default:
-            // For unsupported complex modes (bump, dot, etc.) just sample 2D
-            // at xy; this preserves some texture content rather than black.
+            // For unimplemented modes fall back to plain 2D sample.
             out << "    " << tN << " = " << tex2d << ".Sample(" << samp
                 << ", " << inT << ".xy);\n";
             r.usesStage[stage] = true;
@@ -487,6 +601,36 @@ static Result TranslateImpl(const uint32_t* d) {
     for (int i = 0; i < 4; ++i)
         texMode[i] = (uint8_t)((p.PSTextureModes >> (i * 5)) & PS_TM_MASK);
 
+    // Diagnostic: report PS shaders that use cubemap/reflection sampling.
+    {
+        static int s_cubePsLog = 0;
+        bool anyCube = false;
+        for (int i = 0; i < 4; ++i) {
+            uint8_t m = texMode[i];
+            if (m == PS_TM_CUBEMAP
+             || m == PS_TM_DOT_RFLCT_DIFF
+             || m == PS_TM_DOT_RFLCT_SPEC
+             || m == PS_TM_DOT_STR_CUBE
+             || m == PS_TM_DOT_RFLCT_SPEC_CONST)
+                anyCube = true;
+        }
+        if (anyCube && s_cubePsLog < 16) {
+            fprintf(stderr, "[PS] cube/reflect PS: modes=[0x%02X,0x%02X,0x%02X,0x%02X] PSTextureModes=0x%08X\n",
+                    texMode[0], texMode[1], texMode[2], texMode[3], p.PSTextureModes);
+            ++s_cubePsLog;
+        }
+    }
+    // Diagnostic: log EVERY unique PSTextureModes so we can see what modes
+    // the game actually uses (cube reflection modes are 0x03/0x0B/0x0C/
+    // 0x0E/0x12 — anything other than 00/01/04 is interesting).
+    {
+        static std::unordered_set<uint32_t> s_allModes;
+        if (s_allModes.insert(p.PSTextureModes).second && s_allModes.size() <= 64) {
+            fprintf(stderr, "[PS] PSTextureModes=0x%08X -> [0x%02X,0x%02X,0x%02X,0x%02X]\n",
+                    p.PSTextureModes, texMode[0], texMode[1], texMode[2], texMode[3]);
+        }
+    }
+
     // Decode stages.
     Stage stages[8] = {};
     for (unsigned i = 0; i < numComb && i < 8; ++i) {
@@ -513,13 +657,36 @@ static Result TranslateImpl(const uint32_t* d) {
 
     (void)muxOnMsb; // currently always assume MSB
 
+    // Decode dot-mapping functions and input texture indices from PSDotMapping
+    // and PSInputTexture (mirrors Xemu's other_stage_input).
+    // input_tex[stage]: which prior stage's texture is used as the input for
+    //   dependent / bump reads. -1 means no prior stage.
+    //   input_tex[0] = -1 (always), input_tex[1] = 0 (always), 2 and 3 from PSInputTexture.
+    // dot_map[stage]: dotmap function index 0..7 used for DOT_* modes.
+    //   dot_map[0] = 0, dot_map[1..3] from PSDotMapping nibbles.
+    int input_tex[4] = { -1, 0, 0, 1 };
+    input_tex[2] = (int)((p.PSInputTexture >> 16) & 0xF);
+    input_tex[3] = (int)((p.PSInputTexture >> 20) & 0xF);
+    int dot_map[4] = { 0, 0, 0, 0 };
+    dot_map[1] = (int)((p.PSDotMapping >>  0) & 0xF);
+    dot_map[2] = (int)((p.PSDotMapping >>  4) & 0xF);
+    dot_map[3] = (int)((p.PSDotMapping >>  8) & 0xF);
+
     std::stringstream o;
     o << "// auto-generated from X_D3DPIXELSHADERDEF\n";
     o << "cbuffer PSConstants : register(b0) { float4 psC[32]; };\n";
-    o << "Texture2D tex2D0 : register(t0); SamplerState sampler0 : register(s0);\n";
-    o << "Texture2D tex2D1 : register(t1); SamplerState sampler1 : register(s1);\n";
-    o << "Texture2D tex2D2 : register(t2); SamplerState sampler2 : register(s2);\n";
-    o << "Texture2D tex2D3 : register(t3); SamplerState sampler3 : register(s3);\n";
+    auto isCubeMode = [](uint8_t m) {
+        return m == PS_TM_CUBEMAP
+            || m == PS_TM_DOT_RFLCT_DIFF
+            || m == PS_TM_DOT_RFLCT_SPEC
+            || m == PS_TM_DOT_STR_CUBE
+            || m == PS_TM_DOT_RFLCT_SPEC_CONST;
+    };
+    for (unsigned s = 0; s < 4; ++s) {
+        const char* texType = isCubeMode(texMode[s]) ? "TextureCube" : "Texture2D";
+        o << texType << " tex2D" << s << " : register(t" << s << "); "
+          << "SamplerState sampler" << s << " : register(s" << s << ");\n";
+    }
     o << "\n";
     o << "struct PSInput {\n";
     o << "    float4 pos   : SV_POSITION;\n";
@@ -554,10 +721,13 @@ static Result TranslateImpl(const uint32_t* d) {
     o << "    float4 v1 = input.oD1;\n";
     o << "    float4 vFog = input.oFog;\n";
     // HACK: our emulator doesn't track the fog render state or upload
-    // c[120] (NV2A fog range), so VS programs that write oFog from
-    // MIN(clipZ, c[120].z) end up emitting 0, which the PS final combiner
-    // then uses to pick 100% fog colour (also 0) -> pitch-black interiors.
-    // Until we plumb fog state through, force a no-fog factor of 1.
+    // c[120] (NV2A fog range / params), so VS programs that compute oFog
+    // from MIN(clipZ, c[120].z) end up emitting ~0, which the PS final
+    // combiner then uses to pick 100% fog colour (also 0) -> pitch-black
+    // map. Until fog state is plumbed through, force a no-fog factor of 1.
+    // Cars are unaffected because their VS doesn't write oFog (so the VS
+    // default of 1.0 reaches us anyway); maps DO write oFog and need the
+    // clobber.
     o << "    vFog = float4(1,1,1,1);\n";
     // Texture stages -> t0..t3.
     o << "    float4 t0 = float4(0,0,0,0);\n";
@@ -565,7 +735,7 @@ static Result TranslateImpl(const uint32_t* d) {
     o << "    float4 t2 = float4(0,0,0,0);\n";
     o << "    float4 t3 = float4(0,0,0,0);\n";
     for (unsigned s = 0; s < 4; ++s)
-        EmitTextureStage(o, s, texMode[s], r);
+        EmitTextureStage(o, s, texMode[s], input_tex, dot_map, r);
     // r0/r1/c0/c1: initialised to zero / shader-local constants.
     // On Xbox, r0.a = t0.a before combiners run (and r1.a = t1.a).
     o << "    float4 r0 = float4(0,0,0, t0.a);\n";
@@ -582,19 +752,28 @@ static Result TranslateImpl(const uint32_t* d) {
     o << "    float4 efProd  = float4(0,0,0,0);\n";
     o << "    float4 _discard = float4(0,0,0,0);\n";
 
-    auto emitColorLiteral = [](uint32_t argb) {
-        char buf[96];
-        float a = ((argb >> 24) & 0xFF) / 255.0f;
-        float rr= ((argb >> 16) & 0xFF) / 255.0f;
-        float g = ((argb >>  8) & 0xFF) / 255.0f;
-        float b = ((argb >>  0) & 0xFF) / 255.0f;
-        std::snprintf(buf, sizeof(buf), "float4(%.6ff,%.6ff,%.6ff,%.6ff)", rr, g, b, a);
-        return std::string(buf);
-    };
-
-    // Final-combiner constants (baked into PSDef).
-    o << "    fc0 = " << emitColorLiteral(p.PSFinalCombinerConstant0) << ";\n";
-    o << "    fc1 = " << emitColorLiteral(p.PSFinalCombinerConstant1) << ";\n";
+    // Final-combiner constants. PSFinalCombinerConstants (d[59]) encodes:
+    //   bits[3:0]  = fc0_slot: which C0-bank slot (0-7) fc0 reads from.
+    //                0xF (or > 7) means "use baked PSFinalCombinerConstant0"
+    //                → psC[16] (the dedicated baked slot in our cbuffer).
+    //   bits[7:4]  = fc1_slot: same for C1-bank (psC[8+slot]).
+    //                0xF (or > 7) means "use baked PSFinalCombinerConstant1"
+    //                → psC[17].
+    //   bit[8]     = FogAlpha flag (unused in HLSL emission here).
+    // The baked PSDef values (p.PSFinalCombinerConstant0/1) are exported via
+    // Result::bakedFc0/bakedFc1 so the host seeds psC[16]/[17].
+    {
+        unsigned fc0_slot = p.PSFinalCombinerConstants & 0xFu;
+        unsigned fc1_slot = (p.PSFinalCombinerConstants >> 4) & 0xFu;
+        if (fc0_slot <= 7)
+            o << "    fc0 = psC[" << fc0_slot << "];\n";
+        else
+            o << "    fc0 = psC[16];\n";  // baked fallback
+        if (fc1_slot <= 7)
+            o << "    fc1 = psC[" << (8u + fc1_slot) << "];\n";
+        else
+            o << "    fc1 = psC[17];\n";  // baked fallback
+    }
 
     // Emit combiner stages (with per-stage c0/c1 from PSConstant0/1 mapped
     // via PSC0Mapping/PSC1Mapping: 4-bit slot index per stage).

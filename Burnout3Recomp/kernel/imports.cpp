@@ -216,7 +216,7 @@ static void FireDpc(uint32_t guestDpcAddr, uint8_t* base)
     }
     else
     {
-        fprintf(stderr, "[Kernel] DPC routine 0x%08X not found in funcMap!\n", routineAddr);
+        fprintf(stderr, "[Kernel] DPC routine 0x%08X not found in funcMap! (dpcAddr=0x%08X ctx=0x%08X)\n", routineAddr, guestDpcAddr, deferredContext);
     }
 }
 
