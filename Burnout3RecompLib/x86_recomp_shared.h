@@ -23593,3 +23593,6 @@ extern void sub_36B49A(X86Context& ctx, uint8_t* base);
 extern void sub_36B543(X86Context& ctx, uint8_t* base);
 extern void sub_36B743(X86Context& ctx, uint8_t* base);
 
+extern void HLE_CB3BloomRenderPass(X86Context& ctx, uint8_t* base);
+extern void HLE_CB3BlurRenderPass1(X86Context& ctx, uint8_t* base);
+extern void HLE_CB3BlurRenderPass2(X86Context& ctx, uint8_t* base);

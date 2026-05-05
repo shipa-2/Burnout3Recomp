@@ -113,24 +113,48 @@ static void SetD3DName(IDXGIObject* obj, const char* fmt, ...)
 // ============================================================================
 
 // 2D vertex shader: screen-space XYZRHW → clip space
-// Constant buffer slot 0: float2 screenSize
+// Constant buffer slot 0: float2 screenSize    
 static const char s_vsHlsl[] =
     "cbuffer CB : register(b0) { float2 screenSize; float2 pad; }\n"
     "struct VS_IN { float2 pos : POSITION; float2 uv : TEXCOORD; float4 col : COLOR; };\n"
-    "struct VS_OUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD; float4 col : COLOR; };\n"
+    "struct VS_OUT { float4 pos : SV_POSITION; float4 oD0 : COLOR0; float4 oD1 : COLOR1; float4 oFog : FOG;\n"
+    "  float4 oT0 : TEXCOORD0; float4 oT1 : TEXCOORD1; float4 oT2 : TEXCOORD2; float4 oT3 : TEXCOORD3; };\n"
     "VS_OUT main(VS_IN v) {\n"
     "  VS_OUT o;\n"
     "  o.pos.x =  (v.pos.x / screenSize.x) * 2.0f - 1.0f;\n"
     "  o.pos.y = -(v.pos.y / screenSize.y) * 2.0f + 1.0f;\n"
     "  o.pos.z = 0.0f; o.pos.w = 1.0f;\n"
-    "  o.uv = v.uv; o.col = v.col;\n"
+    "  o.oD0 = v.col; o.oD1 = float4(0,0,0,0); o.oFog = float4(1,1,1,1);\n"
+    "  o.oT0 = float4(v.uv, 0.0f, 1.0f); o.oT1 = float4(v.uv, 0.0f, 1.0f);\n"
+    "  o.oT2 = float4(v.uv, 0.0f, 1.0f); o.oT3 = float4(v.uv, 0.0f, 1.0f);\n"
     "  return o;\n"
     "}\n";
 
+// 2D vertex shader: pre-transformed clip space (used by Tonemapper)
+static const char s_vsHlsl_RHW[] =
+    "cbuffer CB : register(b0) { float2 screenSize; float2 pad; }\n"
+    "struct VS_IN { float4 pos : POSITION; float2 uv : TEXCOORD; float4 col : COLOR; };\n"
+    "struct VS_OUT { float4 pos : SV_POSITION; float4 oD0 : COLOR0; float4 oD1 : COLOR1; float4 oFog : FOG;\n"
+    "  float4 oT0 : TEXCOORD0; float4 oT1 : TEXCOORD1; float4 oT2 : TEXCOORD2; float4 oT3 : TEXCOORD3; };\n"
+    "VS_OUT main(VS_IN v) {\n"
+    "  VS_OUT o;\n"
+    "  o.pos.x =  (v.pos.x / screenSize.x) * 2.0f - 1.0f;\n"
+    "  o.pos.y = -(v.pos.y / screenSize.y) * 2.0f + 1.0f;\n"
+    "  o.pos.z = 0.0f; o.pos.w = 1.0f;\n"
+    "  o.oD0 = v.col; o.oD1 = float4(0,0,0,0); o.oFog = float4(1,1,1,1);\n"
+    "  o.oT0 = float4(v.uv, 0.0f, 1.0f); o.oT1 = float4(v.uv, 0.0f, 1.0f);\n"
+    "  o.oT2 = float4(v.uv, 0.0f, 1.0f); o.oT3 = float4(v.uv, 0.0f, 1.0f);\n"
+    "  return o;\n"
+    "}\n";
+
+// Unified 2D PS Input matching VS_OUT
+static const char s_psInDecl[] = 
+    "struct PS_IN { float4 pos : SV_POSITION; float4 oD0 : COLOR0; float4 oD1 : COLOR1; float4 oFog : FOG;\n"
+    "  float4 oT0 : TEXCOORD0; float4 oT1 : TEXCOORD1; float4 oT2 : TEXCOORD2; float4 oT3 : TEXCOORD3; };\n";
+
 // Untextured pixel shader: use vertex colour only
-static const char s_psUntexturedHlsl[] =
-    "struct PS_IN { float4 pos : SV_POSITION; float2 uv : TEXCOORD; float4 col : COLOR; };\n"
-    "float4 main(PS_IN p) : SV_TARGET { return p.col; }\n";
+static const std::string s_psUntexturedHlsl = std::string(s_psInDecl) +
+    "float4 main(PS_IN p) : SV_TARGET { return p.oD0; }\n";
 
 // 3D untextured PS: same as above but floors the vertex colour so Xbox VS
 // output with oD0 close to 0 (unlit/back-facing) doesn't render as pure
@@ -143,21 +167,17 @@ static const char s_ps3DUntexturedHlsl[] =
 
 // Alpha-only textured pixel shader: for A8/L8/P8-font textures
 // Samples the alpha channel and uses vertex colour's RGB
-static const char s_psAlphaHlsl[] =
-    "Texture2D t : register(t0); SamplerState s : register(s0);\n"
-    "struct PS_IN { float4 pos : SV_POSITION; float2 uv : TEXCOORD; float4 col : COLOR; };\n"
+static const std::string s_psAlphaHlsl = std::string("Texture2D t : register(t0); SamplerState s : register(s0);\n") + s_psInDecl +
     "float4 main(PS_IN p) : SV_TARGET {\n"
-    "  float a = t.Sample(s, p.uv).a;\n"
-    "  return float4(p.col.rgb, p.col.a * a);\n"
+    "  float a = t.Sample(s, p.oT0.xy).a;\n"
+    "  return float4(p.oD0.rgb, p.oD0.a * a);\n"
     "}\n";
 
 // Modulate pixel shader: texture colour * vertex colour
-static const char s_psModulateHlsl[] =
-    "Texture2D t : register(t0); SamplerState s : register(s0);\n"
-    "struct PS_IN { float4 pos : SV_POSITION; float2 uv : TEXCOORD; float4 col : COLOR; };\n"
+static const std::string s_psModulateHlsl = std::string("Texture2D t : register(t0); SamplerState s : register(s0);\n") + s_psInDecl +
     "float4 main(PS_IN p) : SV_TARGET {\n"
-    "  float4 tc = t.Sample(s, p.uv);\n"
-    "  return tc * p.col;\n"
+    "  float4 tc = t.Sample(s, p.oT0.xy);\n"
+    "  return tc * p.oD0;\n"
     "}\n";
 
 // 3D vertex shader: model-space XYZ → clip space via NV2A constant MVP at c[112..115].
@@ -291,6 +311,8 @@ struct D3D11State {
     // 2D Pipeline
     ID3D11VertexShader*       vs2D           = nullptr;
     ID3D11InputLayout*        il2D           = nullptr;
+    ID3D11VertexShader*       vs2D_RHW       = nullptr;
+    ID3D11InputLayout*        il2D_RHW       = nullptr;
     ID3D11PixelShader*        psUntextured   = nullptr;
     ID3D11PixelShader*        psAlpha        = nullptr;
     ID3D11PixelShader*        psModulate     = nullptr;
@@ -1856,12 +1878,27 @@ void D3D_UpdateProjectionViewportTransform(X86Context& ctx, uint8_t* base)
 // Texture management
 // ============================================================================
 
+// ---- NV2A texture state shadowed from the push buffer --------------------
+struct NV2ATextureState {
+    uint32_t offset = 0;   // NV097_SET_TEXTURE_OFFSET  — raw GPU addr
+    uint32_t format = 0;   // context dma + color + logU/V/P + mips + dim
+    uint32_t address = 0;   // wrap modes
+    uint32_t control0 = 0;
+    uint32_t control1 = 0;   // pitch (bits 16..31)
+    uint32_t imageRect = 0;   // (width-1 << 16) | (height-1)
+    uint32_t palette = 0;
+    bool     dirty = false;
+};
+static NV2ATextureState g_nv2aTexture[4];
+
 // D3DDevice_SetTexture  (0x96FD0) — 2 args, ret 8
 extern uint32_t g_currentPSHandle; // defined later in file
 static void HLE_SetTexture(uint8_t* base, uint32_t stage, uint32_t pTexture)
 {
-    if (stage < 4)
+    if (stage < 4) {
         X86_MEM_WRITE_u32(base, kDeviceAddr + 0x0B00 + stage * 4, pTexture);
+        g_nv2aTexture[stage].dirty = false; // CPU took explicit control
+    }
     static int s_logLeft = 16;
     if (s_logLeft > 0) {
         fprintf(stderr, "[HLE] SetTexture stage=%u pTexture=0x%08X\n",
@@ -2019,7 +2056,8 @@ void D3DTexture_GetSurfaceLevel2(X86Context& ctx, uint8_t* base)
     if (pThis != 0) {
         uint32_t pFmt = X86_MEM_READ_u32(base, pThis + 12);
         uint8_t  xF   = (pFmt >> X_D3DFORMAT_FORMAT_SHIFT) & 0xFF;
-        if (xF == X_D3DFMT_A8R8G8B8 || xF == X_D3DFMT_LIN_A8R8G8B8) {
+        if (xF == X_D3DFMT_A8R8G8B8 || xF == X_D3DFMT_LIN_A8R8G8B8 ||
+            xF == X_D3DFMT_X8R8G8B8 || xF == X_D3DFMT_LIN_X8R8G8B8) {
             SurfaceRTBind b;
             b.rt     = nullptr;
             b.mip    = level;
@@ -2328,15 +2366,6 @@ static void ProcessNV2AMethod(uint32_t method, uint32_t value) {
             g_pshConstants[slot][2] = ((value >>  0) & 0xFF) / 255.0f; // B
             g_pshConstants[slot][3] = ((value >> 24) & 0xFF) / 255.0f; // A
             g_pshConstantsDirty |= (1u << slot);
-            // Log slot 2 always (it's fc0 for the tonemapper PSH 0x00900000).
-            // Other slots: log first 8 occurrences each to avoid noise.
-            static int s_logCount[16] = {};
-            if (slot == 2 || s_logCount[slot] < 8) {
-                ++s_logCount[slot];
-                fprintf(stderr,
-                    "[PSH] combiner factor slot=%u (method=0x%04X) value=0x%08X\n",
-                    slot, method, value);
-            }
         }
     }
     // NV097_SET_COMBINER_SPECULAR_FOG_CW0 (0x1E20) and CW1 (0x1E24): the
@@ -2658,19 +2687,6 @@ static inline void NV2A_UploadConst(uint8_t* base, uint32_t slot, const uint8_t*
     memcpy(base + kVshConstantShadow + slot * 16, src, 16);
     s_pbWalkStats_consts++;
 }
-
-// ---- NV2A texture state shadowed from the push buffer --------------------
-struct NV2ATextureState {
-    uint32_t offset    = 0;   // NV097_SET_TEXTURE_OFFSET  — raw GPU addr
-    uint32_t format    = 0;   // context dma + color + logU/V/P + mips + dim
-    uint32_t address   = 0;   // wrap modes
-    uint32_t control0  = 0;
-    uint32_t control1  = 0;   // pitch (bits 16..31)
-    uint32_t imageRect = 0;   // (width-1 << 16) | (height-1)
-    uint32_t palette   = 0;
-    bool     dirty     = false;
-};
-static NV2ATextureState g_nv2aTexture[4];
 
 static void WalkPushBuffer(uint8_t* base) {
     uint32_t pbPut = X86_MEM_READ_u32(base, 0x35D6A0);
@@ -3971,19 +3987,6 @@ void D3DDevice_SetPixelShader(X86Context& ctx, uint8_t* base)
     if (handle != 0 && base) {
         for (uint32_t s = 0; s < 4; ++s)
             g_psTexHandleSnapshot[s] = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + s * 4);
-    }
-    if (handle == 0x00900000) {
-        static int s_set900 = 0;
-        if (s_set900++ < 16) {
-            uint32_t retAddr = X86_MEM_READ_u32(base, ctx.esp);
-            uint32_t hlT0 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
-            uint32_t hlT1 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B04);
-            uint32_t hlT2 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B08);
-            uint32_t hlT3 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B0C);
-            fprintf(stderr,
-                "[PS900-SET] #%d ret=0x%08X prev=0x%08X hlT=[0x%08X,0x%08X,0x%08X,0x%08X]\n",
-                s_set900, retAddr, prevHandle, hlT0, hlT1, hlT2, hlT3);
-        }
     }
     // Lazy translation path: Burnout 3 inlines D3DDevice_CreatePixelShader,
     // so our CreatePixelShader hook never fires. The handle the game passes
@@ -5340,6 +5343,14 @@ void D3DDevice_CopyRects(X86Context& ctx, uint8_t* base)
     if (!g_d3d11.initialized || !g_d3d11.context) { cleanup(); return; }
     if (pSrcSurf == 0 || pDstSurf == 0)            { cleanup(); return; }
 
+    static bool s_diag_enabled = std::getenv("B3_DIAG_POSTFX") != nullptr;
+    if (s_diag_enabled) {
+        uint32_t srcData = pSrcSurf ? X86_MEM_READ_u32(base, pSrcSurf + 4) : 0;
+        uint32_t dstData = pDstSurf ? X86_MEM_READ_u32(base, pDstSurf + 4) : 0;
+        fprintf(stderr, "[DIAG] CopyRects: SrcSurf=0x%08X (Data: 0x%08X) -> DstSurf=0x%08X (Data: 0x%08X)\n",
+            pSrcSurf, srcData, pDstSurf, dstData);
+    }
+
     CopyRectsResource src{}, dst{};
     if (!ResolveCopyRectsResource(base, pSrcSurf, /*forWrite*/false, src) ||
         !ResolveCopyRectsResource(base, pDstSurf, /*forWrite*/true,  dst))
@@ -5842,7 +5853,8 @@ void D3D_CreateSurfaceOfTexture(X86Context& ctx, uint8_t* base) {
     if (pParent != 0) {
         uint32_t pFmt = X86_MEM_READ_u32(base, pParent + 12);
         uint8_t  xF   = (pFmt >> X_D3DFORMAT_FORMAT_SHIFT) & 0xFF;
-        if (xF == X_D3DFMT_A8R8G8B8 || xF == X_D3DFMT_LIN_A8R8G8B8) {
+        if (xF == X_D3DFMT_A8R8G8B8 || xF == X_D3DFMT_LIN_A8R8G8B8 ||
++            xF == X_D3DFMT_X8R8G8B8 || xF == X_D3DFMT_LIN_X8R8G8B8) {
             // Count existing surfaces already registered for this parent;
             // that becomes the mip level for the new surface. NB: the rt
             // pointer is still null at registration time (filled lazily on
@@ -6007,9 +6019,10 @@ static GuestRT* EnsureGuestRT(uint8_t* base, uint32_t parentTexAddr)
     uint32_t dataAddr  = X86_MEM_READ_u32(base, parentTexAddr + 4);
     uint8_t  xFmt      = (fmtField >> X_D3DFORMAT_FORMAT_SHIFT) & 0xFF;
 
-    // Only handle A8R8G8B8 (swizzled or linear) for now — that's the format
-    // Burnout 3 uses for its dynamic env-map render target.
-    if (xFmt != X_D3DFMT_A8R8G8B8 && xFmt != X_D3DFMT_LIN_A8R8G8B8) return nullptr;
+    // Handle A8R8G8B8 and X8R8G8B8 (swizzled or linear). Burnout 3 uses
+    // X8R8G8B8 for several opaque render targets (e.g., tonemapping).
+    if (xFmt != X_D3DFMT_A8R8G8B8 && xFmt != X_D3DFMT_LIN_A8R8G8B8 &&
+        xFmt != X_D3DFMT_X8R8G8B8 && xFmt != X_D3DFMT_LIN_X8R8G8B8) return nullptr;
 
     uint32_t baseW, baseH;
     if (sizeField != 0) {
@@ -6219,6 +6232,25 @@ static ID3D11ShaderResourceView* GetOrCreateTextureSRV(uint8_t* base, uint32_t x
     uint32_t fmtField  = X86_MEM_READ_u32(base, xboxTexAddr + 12);
     uint32_t sizeField = X86_MEM_READ_u32(base, xboxTexAddr + 16);
     if (dataAddr == 0) return nullptr;
+
+    // Check if sampling backbuffer
+    for (int i = 0; i < 4; ++i) {
+        uint32_t bbSurf = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceBackBufBase + i * 4);
+        if (bbSurf != 0 && dataAddr == X86_MEM_READ_u32(base, bbSurf + 4)) {
+            static bool s_diag_enabled = std::getenv("B3_DIAG_POSTFX") != nullptr;
+            if (s_diag_enabled) {
+                fprintf(stderr, "[DIAG] GetOrCreateTextureSRV: Matched BackBuffer at data 0x%08X\n", dataAddr);
+            }
+            return g_d3d11.sceneSRV;
+        }
+    }
+    
+    // Check if sampling depth buffer
+    uint32_t dsSurf = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceDepthStencil);
+    if (dsSurf != 0 && dataAddr == X86_MEM_READ_u32(base, dsSurf + 4)) {
+        return g_d3d11.depthSRV;
+    }
+
 
     uint32_t xFmt = (fmtField >> X_D3DFORMAT_FORMAT_SHIFT) & 0xFF;
 
@@ -6711,9 +6743,9 @@ static void InitRenderingPipeline()
                                            blob->GetBufferSize(), nullptr, pp);
         blob->Release();
     };
-    compPS(s_psUntexturedHlsl, &g_d3d11.psUntextured);
-    compPS(s_psAlphaHlsl,      &g_d3d11.psAlpha);
-    compPS(s_psModulateHlsl,   &g_d3d11.psModulate);
+    compPS(s_psUntexturedHlsl.c_str(), &g_d3d11.psUntextured);
+    compPS(s_psAlphaHlsl.c_str(),      &g_d3d11.psAlpha);
+    compPS(s_psModulateHlsl.c_str(),   &g_d3d11.psModulate);
     SetD3DName(g_d3d11.psUntextured, "B3_PS_2D_Untextured");
     SetD3DName(g_d3d11.psAlpha,      "B3_PS_2D_AlphaOnly");
     SetD3DName(g_d3d11.psModulate,   "B3_PS_2D_Modulate");
@@ -7229,6 +7261,8 @@ static bool BindTranslatedPSFor2D(uint8_t* base, TranslatedPS* tps)
 {
     if (!tps || !tps->ps || !g_d3d11.cbPS) return false;
 
+    // Restore the RS shadow reads. RenderWare 2D draws (like tonemap) rely on the
+    // software state cache which flushes directly into these arrays, bypassing NV2A inline pushes.
     constexpr uint32_t kRSShadowBase  = 0x35FB58;
     constexpr uint32_t kRWPendingBase = 0x75D4A0;
     constexpr uint32_t kPSConstRsIdx  = 10;
@@ -7254,10 +7288,12 @@ static bool BindTranslatedPSFor2D(uint8_t* base, TranslatedPS* tps)
     if (g_psFinalCombinerConst[0] != 0) fcArgb[0] = g_psFinalCombinerConst[0];
     if (g_psFinalCombinerConst[1] != 0) fcArgb[1] = g_psFinalCombinerConst[1];
     for (int k = 0; k < 2; ++k) {
-        uint32_t rs = 26u + (uint32_t)k;
-        if (rs < kHLERenderStateCount) {
-            uint32_t v = g_hleRenderStateCache[rs];
-            if (v != 0) fcArgb[k] = v;
+        if (g_psFinalCombinerConst[k] == 0) {
+            uint32_t rs = 26u + (uint32_t)k;
+            if (rs < kHLERenderStateCount) {
+                uint32_t v = g_hleRenderStateCache[rs];
+                if (v != 0) fcArgb[k] = v;
+            }
         }
     }
     for (int k = 0; k < 2; ++k) {
@@ -7283,13 +7319,18 @@ static bool BindTranslatedPSFor2D(uint8_t* base, TranslatedPS* tps)
     for (unsigned s = 0; s < 4; ++s) {
         if (tps->usesStage[s]) {
             uint32_t addr = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + s * 4);
-            // If the live slot was cleared by SetTexture(NULL) after the PS
-            // was set, fall back to the handle that was bound at PS-set time.
-            // This mirrors the Xbox GPU behaviour: the texture-offset register
-            // retains its last value even when the CPU cache is cleared.
-            if (!addr) addr = g_psTexHandleSnapshot[s];
-            if (addr) srvs[s] = GetOrCreateTextureSRV(base, addr);
-            if (!srvs[s]) srvs[s] = ResolveNV2ATextureSRV(base, s);
+            // Prefer NV2A hardware push buffer if recently updated.
+            if (g_nv2aTexture[s].dirty) {
+                srvs[s] = ResolveNV2ATextureSRV(base, s);
+            } else if (addr) {
+                srvs[s] = GetOrCreateTextureSRV(base, addr);
+            } else {
+                srvs[s] = ResolveNV2ATextureSRV(base, s);
+            }
+            
+            if (!srvs[s] && g_psTexHandleSnapshot[s]) {
+                srvs[s] = GetOrCreateTextureSRV(base, g_psTexHandleSnapshot[s]);
+            }
         }
         samps[s] = g_d3d11.samplerWrap;
     }
@@ -7312,7 +7353,8 @@ static void HLE_DrawBatch2D(const Vtx2D*              verts,
                              uint32_t                  nverts,
                              D3D_PRIMITIVE_TOPOLOGY    topo,
                              ID3D11ShaderResourceView* srv,
-                             bool                      isAlphaOnly)
+                             bool                      isAlphaOnly,
+                             bool                      useRHW = false)
 {
     if (!g_d3d11.initialized || !g_d3d11.pipelineReady || nverts == 0) return;
     if (PpDebug()) ++g_ppDrawsSinceRT;
@@ -7450,9 +7492,15 @@ static void HLE_DrawBatch2D(const Vtx2D*              verts,
     g_d3d11.context->RSSetViewports(1, &vp);
 
     // Vertex shader + input layout + cbuffer
-    SC_VS(g_d3d11.vs2D);
-    SC_VSCB0(g_d3d11.cb2D);
-    SC_IL(g_d3d11.il2D);
+    if (useRHW && g_d3d11.vs2D_RHW) {
+        SC_VS(g_d3d11.vs2D_RHW);
+        SC_VSCB0(g_d3d11.cb2D);
+        SC_IL(g_d3d11.il2D_RHW);
+    } else {
+        SC_VS(g_d3d11.vs2D);
+        SC_VSCB0(g_d3d11.cb2D);
+        SC_IL(g_d3d11.il2D);
+    }
 
     // Pixel shader selection.
     //
@@ -8326,27 +8374,23 @@ static void HLE_Draw3D(uint8_t* base,
     bool colorOpOk = ColorOpUsesTexture();
     (void)colorOpOk;
     if (texAddr) {
-        srv = GetOrCreateTextureSRV(base, texAddr);
-    }
-    if (!srv) {
+        srv = g_nv2aTexture[0].dirty ? ResolveNV2ATextureSRV(base, 0) : GetOrCreateTextureSRV(base, texAddr);
+    } else {
         srv = ResolveNV2ATextureSRV(base, 0);
     }
     // PP fullscreen-quad fallback: try stages 1..3 if stage 0 is empty.
-    // Many Burnout 3 PP passes (bloom composite, motion-blur darken) bind
-    // the scene/RT texture at a non-zero stage and rely on a programmable
-    // pixel shader we can't translate yet.
     if (!srv) {
         for (uint32_t stage = 1; stage < 4; ++stage) {
             uint32_t a = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + stage * 4);
-            if (a == 0) continue;
-            ID3D11ShaderResourceView* s = GetOrCreateTextureSRV(base, a);
+            ID3D11ShaderResourceView* s = nullptr;
+            if (g_nv2aTexture[stage].dirty) {
+                s = ResolveNV2ATextureSRV(base, stage);
+            } else if (a) {
+                s = GetOrCreateTextureSRV(base, a);
+            } else {
+                s = ResolveNV2ATextureSRV(base, stage);
+            }
             if (s) { srv = s; texAddr = a; break; }
-        }
-    }
-    if (!srv) {
-        for (uint32_t stage = 1; stage < 4; ++stage) {
-            ID3D11ShaderResourceView* s = ResolveNV2ATextureSRV(base, stage);
-            if (s) { srv = s; break; }
         }
     }
     {
@@ -8526,42 +8570,6 @@ static void HLE_Draw3D(uint8_t* base,
             // and Cxbx-Reloaded documents that these are maintained as
             // render-state indices 10..25 (X_D3DRS_PSCONSTANT0_0..
             // PSCONSTANT1_7) in 0xAARRGGBB format.
-            //
-            // The canonical shadow in our HLE is g_hleRenderStateCache[],
-            // populated by __rwXbFlushCacheBuffer /
-            // D3DDevice_SetRenderStateNotInline. We also fall back to
-            // reading the Xbox guest-memory shadow at 0x35FB58 and the
-            // RW-pending array at 0x75D4A0 in case code paths bypass
-            // those hooks.
-            constexpr uint32_t kRSShadowBase  = 0x35FB58;
-            constexpr uint32_t kRWPendingBase = 0x75D4A0;
-            constexpr uint32_t kPSConstRsIdx  = 10; // X_D3DRS_PSCONSTANT0_0
-            for (uint32_t i = 0; i < 16; ++i) {
-                uint32_t rs = kPSConstRsIdx + i;
-                uint32_t v = 0;
-                if (rs < kHLERenderStateCount)
-                    v = g_hleRenderStateCache[rs];
-                if (v == 0)
-                    v = X86_MEM_READ_u32(base, kRSShadowBase + rs * 4);
-                if (v == 0)
-                    v = X86_MEM_READ_u32(base, kRWPendingBase + rs * 4);
-                // Only overwrite g_pshConstants[i] when the RS shadow
-                // actually holds a value. Burnout 3 inlines
-                // SetPixelShaderConstant and writes directly to the NV2A
-                // combiner-factor methods (0x1A60..0x1AA0); ProcessNV2AMethod
-                // populates g_pshConstants[] + dirty bit. If we then clobber
-                // with RS-shadow zeros just because the dirty bit is set,
-                // the translucent ground/window PS loses its modulation
-                // factor and outputs pure black (looks fully transparent
-                // over the planar reflection).
-                if (v != 0) {
-                    g_pshConstants[i][0] = ((v >> 16) & 0xFF) / 255.0f;
-                    g_pshConstants[i][1] = ((v >>  8) & 0xFF) / 255.0f;
-                    g_pshConstants[i][2] = ((v >>  0) & 0xFF) / 255.0f;
-                    g_pshConstants[i][3] = ((v >> 24) & 0xFF) / 255.0f;
-                    g_pshConstantsDirty |= (1u << i);
-                }
-            }
             static int s_logRS = 0;
             if (s_logRS < 4) {
                 fprintf(stderr,
@@ -8647,10 +8655,12 @@ static void HLE_Draw3D(uint8_t* base,
             if (g_psFinalCombinerConst[0] != 0) fcArgb[0] = g_psFinalCombinerConst[0];
             if (g_psFinalCombinerConst[1] != 0) fcArgb[1] = g_psFinalCombinerConst[1];
             for (int k = 0; k < 2; ++k) {
-                uint32_t rs = 26u + (uint32_t)k;
-                if (rs < kHLERenderStateCount) {
-                    uint32_t v = g_hleRenderStateCache[rs];
-                    if (v != 0) fcArgb[k] = v;
+                if (g_psFinalCombinerConst[k] == 0) {
+                    uint32_t rs = 26u + (uint32_t)k;
+                    if (rs < kHLERenderStateCount) {
+                        uint32_t v = g_hleRenderStateCache[rs];
+                        if (v != 0) fcArgb[k] = v;
+                    }
                 }
             }
             for (int k = 0; k < 2; ++k) {
@@ -8685,8 +8695,18 @@ static void HLE_Draw3D(uint8_t* base,
             if (tps->usesStage[s]) {
                 uint32_t addr = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + s * 4);
                 stageAddr[s] = addr;
-                if (addr) stageSrv = GetOrCreateTextureSRV(base, addr);
-                if (!stageSrv) stageSrv = ResolveNV2ATextureSRV(base, s);
+                
+                if (g_nv2aTexture[s].dirty) {
+                    stageSrv = ResolveNV2ATextureSRV(base, s);
+                } else if (addr) {
+                    stageSrv = GetOrCreateTextureSRV(base, addr);
+                } else {
+                    stageSrv = ResolveNV2ATextureSRV(base, s);
+                }
+
+                if (!stageSrv && g_psTexHandleSnapshot[s]) {
+                    stageSrv = GetOrCreateTextureSRV(base, g_psTexHandleSnapshot[s]);
+                }
             }
             srvs[s]  = stageSrv;
             samps[s] = g_d3d11.samplerWrap;
@@ -8900,7 +8920,7 @@ static void DrawSWVertsD3D11(uint8_t* base, const SWVertex* sv, size_t n, int pr
     if (!verts.empty()) {
         g_b2dCallerTag = "SW";
         g_b2dBase = base;
-        HLE_DrawBatch2D(verts.data(), static_cast<uint32_t>(verts.size()), topo, srv, isAlphaOnly);
+        HLE_DrawBatch2D(verts.data(), static_cast<uint32_t>(verts.size()), topo, srv, isAlphaOnly, true);
         g_b2dBase = nullptr;
     }
 }
@@ -8921,13 +8941,18 @@ static void DrawSWVertsWithTexD3D11(uint8_t* base, const SWVertex* sv, size_t n,
 
     ID3D11ShaderResourceView* srv = nullptr;
     bool isAlphaOnly = false;
-    if (useTexture) {
+    if (g_nv2aTexture[0].dirty) {
+        srv = ResolveNV2ATextureSRV(base, 0);
+    } else if (useTexture) {
         srv = GetOrCreateTextureSRV(base, texAddr);
-        if (srv) {
-            auto it = g_d3d11.textureCache.find(texAddr);
-            if (it != g_d3d11.textureCache.end())
-                isAlphaOnly = it->second.isAlphaOnly;
-        }
+    } else {
+        srv = ResolveNV2ATextureSRV(base, 0);
+    }
+
+    if (srv && !g_nv2aTexture[0].dirty && texAddr) {
+        auto it = g_d3d11.textureCache.find(texAddr);
+        if (it != g_d3d11.textureCache.end())
+            isAlphaOnly = it->second.isAlphaOnly;
     }
 
     // Post-process fallback: many Burnout 3 fullscreen-quad PP passes
@@ -8941,29 +8966,19 @@ static void DrawSWVertsWithTexD3D11(uint8_t* base, const SWVertex* sv, size_t n,
     if (!srv) {
         for (uint32_t stage = 1; stage < 4; ++stage) {
             uint32_t a = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + stage * 4);
-            if (a == 0) continue;
-            ID3D11ShaderResourceView* s = GetOrCreateTextureSRV(base, a);
-            if (s) { srv = s; texAddr = a; break; }
-        }
-    }
-    // NV2A pushbuffer fallback: RenderWare's post-FX path bypasses
-    // D3DDevice_SetTexture entirely and binds the bloom/scene RT via
-    // direct NV097_SET_TEXTURE_OFFSET methods. Honor that here so the
-    // SubmitPrims/DrawSWVertsWithTex path doesn't render white quads.
-    if (!srv) {
-        for (uint32_t stage = 0; stage < 4; ++stage) {
-            ID3D11ShaderResourceView* s = ResolveNV2ATextureSRV(base, stage);
-            if (s) {
-                srv = s;
-                static int s_swNV = 0;
-                if (s_swNV < 32) {
-                    fprintf(stderr,
-                        "[PP] DrawSWVertsWithTex: NV2A stage %u srv=%p offs=0x%08X "
-                        "fmt=0x%08X rect=0x%08X (n=%zu prim=%d)\n",
-                        stage, (void*)s,
-                        g_nv2aTexture[stage].offset, g_nv2aTexture[stage].format,
-                        g_nv2aTexture[stage].imageRect, n, primType);
-                    ++s_swNV;
+            if (g_nv2aTexture[stage].dirty) {
+                srv = ResolveNV2ATextureSRV(base, stage);
+            } else if (a) {
+                srv = GetOrCreateTextureSRV(base, a);
+            } else {
+                srv = ResolveNV2ATextureSRV(base, stage);
+            }
+            if (srv) {
+                texAddr = a;
+                if (!g_nv2aTexture[stage].dirty && a) {
+                    auto it = g_d3d11.textureCache.find(a);
+                    if (it != g_d3d11.textureCache.end())
+                        isAlphaOnly = it->second.isAlphaOnly;
                 }
                 break;
             }
@@ -9177,69 +9192,78 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
     ID3D11ShaderResourceView* srv = nullptr;
     bool isAlphaOnly = false;
     uint32_t texW = 1, texH = 1;
-    if (useTexture) {
+    if (g_nv2aTexture[0].dirty) {
+        srv = ResolveNV2ATextureSRV(base, 0);
+    } else if (useTexture) {
         srv = GetOrCreateTextureSRV(base, texAddr);
-        if (srv) {
+    } else {
+        srv = ResolveNV2ATextureSRV(base, 0);
+    }
+    if (srv) {
+        if (!g_nv2aTexture[0].dirty && texAddr) {
             auto it = g_d3d11.textureCache.find(texAddr);
             if (it != g_d3d11.textureCache.end()) {
                 isAlphaOnly = it->second.isAlphaOnly;
                 texW = it->second.width;
                 texH = it->second.height;
             }
-        }
-    }
-    // Post-process fallback: PP fullscreen quads bind the scene/RT at
-    // stages 1..3 (not stage 0). Without this we'd render psUntextured
-    // (white rectangles).
-    if (!srv) {
-        for (uint32_t stage = 1; stage < 4; ++stage) {
-            uint32_t a = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + stage * 4);
-            if (a == 0) continue;
-            ID3D11ShaderResourceView* s = GetOrCreateTextureSRV(base, a);
-            if (!s) continue;
-            srv = s; texAddr = a;
-            auto it = g_d3d11.textureCache.find(a);
-            if (it != g_d3d11.textureCache.end()) {
-                isAlphaOnly = it->second.isAlphaOnly;
-                texW = it->second.width;
-                texH = it->second.height;
-            }
-            break;
-        }
-    }
-    // Post-process fallback (NV2A path): RenderWare's post-FX writes the
-    // bloom/reflection sample texture directly into the NV097 SET_TEXTURE_*
-    // pushbuffer methods, bypassing D3DDevice_SetTexture entirely. Try the
-    // shadowed NV2A texture state for stages 0..3 and pull the GuestRT SRV
-    // by data-address if it matches a tracked render-to-texture.
-    if (!srv) {
-        for (uint32_t stage = 0; stage < 4; ++stage) {
-            ID3D11ShaderResourceView* s = ResolveNV2ATextureSRV(base, stage);
-            if (!s) continue;
-            srv = s;
-            // Try to recover dimensions from the NV2A image-rect.
-            const NV2ATextureState& st = g_nv2aTexture[stage];
+        } else {
+            const NV2ATextureState& st = g_nv2aTexture[0];
             if (st.imageRect != 0) {
                 texW = (st.imageRect >> 16) & 0xFFFF;
                 texH = (st.imageRect >>  0) & 0xFFFF;
+            }
+        }
+        if (texW == 0) texW = 1;
+        if (texH == 0) texH = 1;
+    }
+    
+    if (!srv) {
+        for (uint32_t stage = 1; stage < 4; ++stage) {
+            uint32_t a = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + stage * 4);
+            if (g_nv2aTexture[stage].dirty) {
+                srv = ResolveNV2ATextureSRV(base, stage);
+            } else if (a) {
+                srv = GetOrCreateTextureSRV(base, a);
+            } else {
+                srv = ResolveNV2ATextureSRV(base, stage);
+            }
+            
+            if (srv) {
+                texAddr = a;
+                if (!g_nv2aTexture[stage].dirty && a) {
+                    auto it = g_d3d11.textureCache.find(a);
+                    if (it != g_d3d11.textureCache.end()) {
+                        isAlphaOnly = it->second.isAlphaOnly;
+                        texW = it->second.width;
+                        texH = it->second.height;
+                    }
+                } else {
+                    const NV2ATextureState& st = g_nv2aTexture[stage];
+                    if (st.imageRect != 0) {
+                        texW = (st.imageRect >> 16) & 0xFFFF;
+                        texH = (st.imageRect >>  0) & 0xFFFF;
+                    }
+                }
                 if (texW == 0) texW = 1;
                 if (texH == 0) texH = 1;
+                break;
             }
-            static int s_nv2aPP = 0;
-            if (s_nv2aPP++ < 16) {
-                fprintf(stderr,
-                    "[PP] DrawVerticesUP: NV2A stage %u srv=%p offs=0x%08X "
-                    "fmt=0x%08X rect=0x%08X (%ux%u)\n",
-                    stage, (void*)srv, st.offset, st.format, st.imageRect,
-                    texW, texH);
-            }
-            break;
         }
     }
     
-    // Detect if UVs are in pixel coordinates (only relevant for non-stride-28 format)
+    uint32_t fvf = g_currentFVF;
+    if (!(fvf & D3DFVF_XYZRHW) && !(fvf & D3DFVF_XYZ)) {
+        // Guess FVF from stride if invalid (RenderWare typically sets FVF to 0 for these)
+        if (vtxStride == 28) fvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | (1 << D3DFVF_TEXCOUNT_SHIFT);
+        else if (vtxStride == 24) fvf = D3DFVF_XYZRHW | (1 << D3DFVF_TEXCOUNT_SHIFT);
+        else if (vtxStride == 20) fvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE;
+        else fvf = D3DFVF_XYZRHW;
+    }
+
+    // Detect if UVs are in pixel coordinates
     bool uvInPixels = false;
-    if (vtxStride != 28 && srv && texW > 1 && texH > 1) {
+    if (vtxStride != 28 && vtxStride != 24 && srv && texW > 1 && texH > 1) {
         float maxUV = 0.0f;
         for (uint32_t i = 0; i < vtxCount; i++) {
             uint32_t off = pVtxData + i * vtxStride;
@@ -9249,23 +9273,68 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
             if (fabsf(us) > maxUV) maxUV = fabsf(us);
             if (fabsf(vs) > maxUV) maxUV = fabsf(vs);
         }
-        uvInPixels = (maxUV > 1.5f);
+        // Tighten the pixel coordinate heuristic. Standard UVs are [0.0, 1.0]. 
+        // A tonemapper quad with 1.0 will not trigger this.
+        uvInPixels = (maxUV > 2.0f);
     }
 
     // Build normalized Vtx2D array
     std::vector<Vtx2D> v2d(vtxCount);
     for (uint32_t i = 0; i < vtxCount; i++) {
         uint32_t off = pVtxData + i * vtxStride;
-        float x, y, u, v;
-        uint32_t col;
-        memcpy(&x, base + off,     4);
-        memcpy(&y, base + off + 4, 4);
-        if (vtxStride == 28) {
+        float x, y, u = 0.0f, v = 0.0f;
+        uint32_t col = 0xFFFFFFFF;
+
+        bool useFVF = (g_currentFVF != 0 && FVFVertexSize(g_currentFVF) == vtxStride);
+
+        if (useFVF) {
+            SWVertex sv = ParseFVFVertex(base + off, g_currentFVF);
+            x = sv.x; y = sv.y; u = sv.u; v = sv.v; col = sv.diffuse;
+        } else if (vtxStride == 24) {
+            uint32_t dw12 = X86_MEM_READ_u32(base, off + 12);
+            uint32_t dw16 = X86_MEM_READ_u32(base, off + 16);
+            
+            bool isXYZ_DIFFUSE_TEX1 = false;
+            if ((dw12 & 0xFF000000) == 0xFF000000 && (dw16 == 0x00000000 || dw16 == 0x3F800000)) {
+                isXYZ_DIFFUSE_TEX1 = true;
+            } else if ((dw16 & 0xFF000000) >= 0x80000000) {
+                isXYZ_DIFFUSE_TEX1 = false;
+            } else {
+                float f12; memcpy(&f12, &dw12, 4);
+                if (std::isnan(f12) || fabsf(f12) > 10000.0f) {
+                    isXYZ_DIFFUSE_TEX1 = true;
+                }
+            }
+
+            if (isXYZ_DIFFUSE_TEX1) {
+                // XYZ | DIFFUSE | TEX1 : X@0, Y@4, Z@8, Col@12, U@16, V@20
+                memcpy(&x, base + off, 4);
+                memcpy(&y, base + off + 4, 4);
+                col = dw12;
+                memcpy(&u, base + off + 16, 4);
+                memcpy(&v, base + off + 20, 4);
+            } else {
+                // RW custom: X@0, Y@4, U@8, V@12, Col@16
+                memcpy(&x, base + off, 4);
+                memcpy(&y, base + off + 4, 4);
+                memcpy(&u, base + off + 8, 4);
+                memcpy(&v, base + off + 12, 4);
+                col = dw16;
+                if (uvInPixels) {
+                    u /= static_cast<float>(texW);
+                    v /= static_cast<float>(texH);
+                }
+            }
+        } else if (vtxStride == 28) {
+            memcpy(&x, base + off,     4);
+            memcpy(&y, base + off + 4, 4);
             // D3DFVF_XYZRHW|DIFFUSE|TEX1: X@0,Y@4,Z@8,W@12,col@16,U@20,V@24
             col = X86_MEM_READ_u32(base, off + 16);
             memcpy(&u, base + off + 20, 4);
             memcpy(&v, base + off + 24, 4);
         } else {
+            memcpy(&x, base + off,     4);
+            memcpy(&y, base + off + 4, 4);
             // RW custom format: X@0,Y@4,U@8,V@12,col@16
             float ur, vr;
             memcpy(&ur, base + off + 8,  4);
@@ -9318,8 +9387,10 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
     if (!expanded.empty()) {
         g_b2dCallerTag = "DVUP";
         g_b2dBase = base;
+
+        bool isRHW = (fvf & D3DFVF_XYZRHW) != 0;
         HLE_DrawBatch2D(expanded.data(), static_cast<uint32_t>(expanded.size()),
-                        topo, srv, isAlphaOnly);
+                        topo, srv, isAlphaOnly, isRHW);
         g_b2dBase = nullptr;
     }
 
@@ -9393,28 +9464,40 @@ void D3DDevice_DrawIndexedVertices(X86Context& ctx, uint8_t* base) {
     bool useTexture  = (texAddr != 0) && (g_currentPSHandle != 0 || ColorOpUsesTexture());
     ID3D11ShaderResourceView* srv = nullptr;
     bool isAlphaOnly = false;
-    if (useTexture) {
+    if (g_nv2aTexture[0].dirty) {
+        srv = ResolveNV2ATextureSRV(base, 0);
+    } else if (useTexture) {
         srv = GetOrCreateTextureSRV(base, texAddr);
-        if (srv) {
-            auto it = g_d3d11.textureCache.find(texAddr);
-            if (it != g_d3d11.textureCache.end())
-                isAlphaOnly = it->second.isAlphaOnly;
-        }
+    } else {
+        srv = ResolveNV2ATextureSRV(base, 0);
     }
-    // PP fullscreen-quad fallback: try stages 1..3 if stage 0 is empty.
+
+    if (srv && !g_nv2aTexture[0].dirty && texAddr) {
+        auto it = g_d3d11.textureCache.find(texAddr);
+        if (it != g_d3d11.textureCache.end())
+            isAlphaOnly = it->second.isAlphaOnly;
+    }
+    
     if (!srv) {
         for (uint32_t stage = 1; stage < 4; ++stage) {
             uint32_t a = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + stage * 4);
-            if (a == 0) continue;
-            ID3D11ShaderResourceView* s = GetOrCreateTextureSRV(base, a);
-            if (s) { srv = s; texAddr = a; break; }
-        }
-    }
-    // PP fallback (NV2A pushbuffer-bound textures, e.g. bloom RT).
-    if (!srv) {
-        for (uint32_t stage = 0; stage < 4; ++stage) {
-            ID3D11ShaderResourceView* s = ResolveNV2ATextureSRV(base, stage);
-            if (s) { srv = s; break; }
+            if (g_nv2aTexture[stage].dirty) {
+                srv = ResolveNV2ATextureSRV(base, stage);
+            } else if (a) {
+                srv = GetOrCreateTextureSRV(base, a);
+            } else {
+                srv = ResolveNV2ATextureSRV(base, stage);
+            }
+            
+            if (srv) {
+                texAddr = a;
+                if (!g_nv2aTexture[stage].dirty && a) {
+                    auto it = g_d3d11.textureCache.find(a);
+                    if (it != g_d3d11.textureCache.end())
+                        isAlphaOnly = it->second.isAlphaOnly;
+                }
+                break;
+            }
         }
     }
 
@@ -9479,7 +9562,7 @@ void D3DDevice_DrawIndexedVertices(X86Context& ctx, uint8_t* base) {
         g_b2dCallerTag = "DI";
         g_b2dBase = base;
         HLE_DrawBatch2D(expanded.data(), static_cast<uint32_t>(expanded.size()),
-                        topo, srv, isAlphaOnly);
+                        topo, srv, isAlphaOnly, false);
         g_b2dBase = nullptr;
     }
 
@@ -11154,3 +11237,195 @@ void __rwXbCacheInit(X86Context& ctx, uint8_t* base)
     GuestReturn32(ctx, 0);
     GuestStackCleanup(ctx, 0);
 }
+
+// ============================================================================
+// Post-Processing Hooks (Bloom & Blur)
+// ============================================================================
+
+// sub_1AD350 — Bloom single-pass renderer.
+//
+// Called from sub_1AE6F0 three times per bloom chain:
+//   Pass 0: RT = bloom mip 0,   src = scene          → opaque downsample
+//   Pass 1: RT = bloom mip 1,   src = bloom mip 0    → opaque blur/copy
+//   Pass 2: RT = back buffer,   src = bloom mip 1    → ADDITIVE composite
+//
+// The Xbox code programs blend state via D3DDevice_SetRenderState which does
+// NOT always feed through WalkPushBuffer, so g_alphaBlendEnabled can be stale.
+// We therefore determine blend from the render-target type rather than trusting
+// the tracked NV2A state:
+//   - Guest mip RT  → bsOpaque (straight copy, builds the downsample chain)
+//   - Back buffer   → ONE+ONE additive (overlay bloom on the rendered scene)
+//
+// Without this distinction every pass would write the source texture opaquely
+// to the back buffer — replacing the scene entirely (car-select fullscreen
+// car-texture bug) and wiping the environment during races.
+void sub_1AD350(X86Context& ctx, uint8_t* base) {
+    if (!g_d3d11.initialized || !g_d3d11.pipelineReady ||
+        !g_d3d11.vs2D || !g_d3d11.il2D || !g_d3d11.psModulate ||
+        !g_d3d11.dynamicVB || !g_d3d11.cb2D) {
+        GuestReturn32(ctx, 0);
+        GuestStackCleanup(ctx, 8);
+        return;
+    }
+
+    WalkPushBuffer(base);
+
+    // Capture the GuestRT that was active before BindActiveRenderTarget
+    // potentially clears it. For the composite pass (back buffer target),
+    // this is the bloom mip that was just rendered into and is our source.
+    GuestRT* prevGuestRT    = g_d3d11.activeGuestRT;
+    uint32_t prevGuestRTMip = g_d3d11.activeGuestRTMip;
+
+    bool isGuestMip = BindActiveRenderTarget(base, false);
+
+    uint32_t texAddr = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
+    ID3D11ShaderResourceView* srv = nullptr;
+
+    if (!isGuestMip && prevGuestRT && prevGuestRT->srv) {
+        // Composite pass: source is the bloom GuestRT that the previous
+        // mip pass rendered into. Use the SRV that excludes the mip we
+        // were just writing to, to avoid any RTV/SRV hazard.
+        if (prevGuestRTMip > 0 &&
+            prevGuestRTMip < prevGuestRT->srvSrcExclMip.size() &&
+            prevGuestRT->srvSrcExclMip[prevGuestRTMip]) {
+            srv = prevGuestRT->srvSrcExclMip[prevGuestRTMip];
+        } else {
+            srv = prevGuestRT->srv;
+        }
+    } else {
+        // Mip downsample/blur pass: source comes from the NV2A pushbuffer
+        // texture state (scene or previous mip), not the stale HLE slot.
+        if (g_nv2aTexture[0].dirty || g_nv2aTexture[0].offset != 0) {
+            srv = ResolveNV2ATextureSRV(base, 0);
+            g_nv2aTexture[0].dirty = false;
+        }
+        if (!srv && texAddr) {
+            srv = GetOrCreateTextureSRV(base, texAddr);
+        }
+    }
+
+    if (!srv) {
+        GuestReturn32(ctx, 0);
+        GuestStackCleanup(ctx, 8);
+        return;
+    }
+
+    static int s_log = 0;
+    if (s_log++ < 16) {
+        fprintf(stderr,
+            "[HLE] bloom pass: isGuestMip=%d prevRT=%p prevMip=%u srv=%p"
+            " texAddr=0x%08X blendEn=%d src=0x%X dst=0x%X\n",
+            (int)isGuestMip, (void*)prevGuestRT, prevGuestRTMip, (void*)srv,
+            texAddr, (int)g_alphaBlendEnabled, g_blendSrc, g_blendDst);
+    }
+
+    // Fullscreen quad in screen-space.
+    // vs2D: pos (0..W, 0..H) / screenSize (W, H) → NDC [-1..+1].
+    // BindActiveRenderTarget sets the D3D11 viewport to the mip dimensions so
+    // the full-NDC quad correctly covers the destination surface regardless of
+    // whether it is 720×480 (backbuffer) or 64×64 (bloom mip).
+    const float W = static_cast<float>(g_d3d11.width);
+    const float H = static_cast<float>(g_d3d11.height);
+    const Vtx2D quad[4] = {
+        { 0.f, 0.f, 0.f, 0.f, 0xFFFFFFFFu },
+        { W,   0.f, 1.f, 0.f, 0xFFFFFFFFu },
+        { 0.f, H,   0.f, 1.f, 0xFFFFFFFFu },
+        { W,   H,   1.f, 1.f, 0xFFFFFFFFu },
+    };
+    constexpr uint32_t kNVerts   = 4;
+    constexpr uint32_t kVBNeeded = kNVerts * sizeof(Vtx2D);
+
+    if (kVBNeeded > g_d3d11.dynamicVBSize) {
+        GuestReturn32(ctx, 0);
+        GuestStackCleanup(ctx, 8);
+        return;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mr = {};
+    if (FAILED(g_d3d11.context->Map(g_d3d11.dynamicVB, 0,
+                                     D3D11_MAP_WRITE_DISCARD, 0, &mr))) {
+        GuestReturn32(ctx, 0);
+        GuestStackCleanup(ctx, 8);
+        return;
+    }
+    memcpy(mr.pData, quad, kVBNeeded);
+    g_d3d11.context->Unmap(g_d3d11.dynamicVB, 0);
+
+    if (SUCCEEDED(g_d3d11.context->Map(g_d3d11.cb2D, 0,
+                                        D3D11_MAP_WRITE_DISCARD, 0, &mr))) {
+        float* cb = static_cast<float*>(mr.pData);
+        cb[0] = W; cb[1] = H; cb[2] = 0.f; cb[3] = 0.f;
+        g_d3d11.context->Unmap(g_d3d11.cb2D, 0);
+    }
+
+    // Bind the RT set by the Xbox code.  Returns true  → we're on a guest mip
+    // (downsample/blur pass).  Returns false → we're on the back buffer
+    // (composite pass).
+    isGuestMip = BindActiveRenderTarget(base, false);
+
+    float bf[4] = { 1.f, 1.f, 1.f, 1.f };
+    ID3D11BlendState* bs;
+    if (isGuestMip) {
+        // Downsample / blur into the bloom mip pyramid — straight copy.
+        bs = g_d3d11.bsOpaque;
+    } else {
+        // Composite to back buffer — additive (ONE+ONE) so the bloom overlays
+        // the already-rendered scene instead of replacing it.
+        // NV factor 0x0001 = D3D11_BLEND_ONE (see NvBlendFactorToD3D11).
+        bs = GetOrCreateBlendState(
+            0x0001u, 0x0001u,   // SRC=ONE, DST=ONE
+            true,                // blend enabled
+            g_colorWriteMask,
+            g_blendEquation);
+        if (!bs) bs = g_d3d11.bsAlpha;
+    }
+
+    SC_BlendState(bs, bf, 0xFFFFFFFFu);
+    SC_DepthStencil(g_d3d11.dssOff, 0);
+    SC_Raster(g_d3d11.rsNoCull);
+
+    SC_VS(g_d3d11.vs2D);
+    SC_VSCB0(g_d3d11.cb2D);
+    SC_IL(g_d3d11.il2D);
+    SC_PS(g_d3d11.psModulate);  // tex × vtx_color; vtx_color = white → passthrough
+
+    ID3D11ShaderResourceView* srvs[1]  = { srv };
+    ID3D11SamplerState*       samps[1] = { g_d3d11.samplerLinear };
+    SC_PSSRVs(1, srvs);
+    SC_PSSamplers(1, samps);
+
+    UINT stride = sizeof(Vtx2D), offset = 0;
+    SC_VB(g_d3d11.dynamicVB, stride, offset);
+    SC_Topology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    g_d3d11.context->Draw(kNVerts, 0);
+
+    // Detach SRV to prevent D3D11 read/write-hazard warnings on the next bind.
+    ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
+    SC_PSSRVs(1, nullSRV);
+
+    // static int s_log = 0;
+    // if (s_log++ < 8) {
+    //     fprintf(stderr,
+    //         "[HLE] bloom pass: texAddr=0x%08X srv=%p isGuestMip=%d"
+    //         " blendEn=%d src=0x%X dst=0x%X\n",
+    //         texAddr, (void*)srv, (int)isGuestMip,
+    //         (int)g_alphaBlendEnabled, g_blendSrc, g_blendDst);
+    // }
+
+    GuestReturn32(ctx, 0);
+    GuestStackCleanup(ctx, 8);
+}
+
+// void sub_1AD7A0(X86Context& ctx, uint8_t* base) {
+//     fprintf(stderr, "[HLE] Custom Blur Render Pass 1 Executed\n");
+//     // TODO: Invoke custom D3D11 blur downsample pass
+//     GuestReturn32(ctx, 0);
+//     GuestStackCleanup(ctx, 4);
+// }
+
+// void sub_1ADD60(X86Context& ctx, uint8_t* base) {
+//     fprintf(stderr, "[HLE] Custom Blur Render Pass 2 Executed\n");
+//     // TODO: Invoke custom D3D11 blur resolve pass
+//     GuestReturn32(ctx, 0);
+//     GuestStackCleanup(ctx, 4);
+// }
