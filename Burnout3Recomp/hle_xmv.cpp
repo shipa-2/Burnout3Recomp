@@ -1299,6 +1299,25 @@ void XMVDecoder_GetNextFrame(X86Context& ctx, uint8_t* base)
 
     HLE_XmvDecoder* dec = it->second;
 
+#ifdef _WIN32
+    // Skip hotkey: pressing Enter instantly finishes the currently playing video.
+    // Track the previous key state to fire only on a fresh press (not a held key).
+    if (!dec->terminated && !dec->eof) {
+        static bool s_enterWasDown = false;
+        bool enterDown = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
+        if (enterDown && !s_enterWasDown) {
+            fprintf(stderr, "[HLE_XMV] Skip hotkey (Tab) — terminating video 0x%08X\n", pDecoder);
+            dec->terminated = true;
+            {
+                std::lock_guard<std::mutex> blk(dec->bgMtx);
+                dec->bgShutdown = true;
+            }
+            dec->bgWorkCv.notify_one();
+        }
+        s_enterWasDown = enterDown;
+    }
+#endif
+
     // If already terminated or EOF, signal end-of-video
     if (dec->terminated || dec->eof) {
         if (pStatusOut) X86_MEM_WRITE_u32(base, pStatusOut, 2u);
