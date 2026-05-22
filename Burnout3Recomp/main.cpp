@@ -22,12 +22,18 @@
 //                             Managed by GuestVMAlloc (bump allocator).
 //                             Backing store for NtAllocateVirtualMemory:
 //                             TiMidity GUS patches (~150 MB) + Doom zone heap.
-//   0x18000000 - 0x18800000 : HLE o1heap (8 MB)
-//                             Used only by HLE code (DSound objects, etc.).
-//   0x19000000 - 0x1A800000 : D3D contiguous GPU memory (ContigAlloc, 24 MB)
-//   0x1F000000 - 0x1FFFFFFF : Stack region (~16 MB)
+//   0x18000000 - 0x1C000000 : HLE o1heap (64 MB, HEAP_SIZE)
+//                             Used only by HLE code (DSound buffers, thread
+//                             stacks, kernel objects, etc.).
+//   0x1C000000 - 0x1FEF0000 : D3D contiguous GPU memory (ContigAlloc, ~63 MB)
+//                             Bump allocator for VBs, textures, surfaces, RTs.
+//                             Must stay below STACK_TOP-STACK_SIZE = 0x1FEF0000.
+//   0x1FEF0000 - 0x1FFFFFFF : Stack region (1 MB, STACK_SIZE)
 //
-// IMPORTANT: The two allocators must never overlap.
+// IMPORTANT: g_heap (0x18000000–0x1C000000) and ContigAlloc (0x1C000000+)
+// must never overlap.  ContigAlloc was previously at 0x19000000 which fell
+// inside the g_heap arena, causing guest thread stacks / DSound buffers
+// allocated from g_heap to corrupt D3D VB headers allocated by ContigAlloc.
 // ---------------------------------------------------------------------------
 
 static constexpr uint32_t HEAP_BASE  = 0x18000000; // HLE o1heap starts here

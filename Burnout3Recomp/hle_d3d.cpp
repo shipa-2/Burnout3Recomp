@@ -76,6 +76,18 @@ struct VsCacheEntry {
 };
 static std::unordered_map<uint32_t, VsCacheEntry> g_vsByHandle;
 
+// Occlusion / visibility test query pool.
+// Xbox API: BeginVisibilityTest() starts accumulating; EndVisibilityTest(index)
+// ends and tags the result at 'index'; GetVisibilityTestResult(index,...)
+// reads it back.  We map each index to a D3D11 D3D11_QUERY_OCCLUSION query.
+struct VisibilitySlot {
+    ID3D11Query* query = nullptr;
+    UINT64       count = 0;
+    bool         ready = false;
+};
+static ID3D11Query*                               g_visActiveQuery = nullptr;
+static std::unordered_map<uint32_t, VisibilitySlot> g_visSlots;
+
 // Forward declaration — D3DCompile wrapper defined much later in this file.
 static ID3DBlob* D3D11CompileShader(const char* hlsl, const char* entry, const char* target);
 
@@ -878,13 +890,20 @@ static bool IsRTFormat(uint8_t xFmt) {
 // ============================================================================
 // Simple contiguous-memory bump allocator for guest GPU resources
 // ============================================================================
-// ContigAlloc region starts at 0x19000000, above the o1heap (0x200000..0x19000000),
-// to prevent the GPU resource bump allocator from corrupting heap-managed memory.
-static uint32_t s_contigAllocHead = 0x19000000;
+// ContigAlloc region starts at 0x1C000000, just above the HLE o1heap arena
+// (0x18000000–0x1C000000, 64 MB).  The two allocators must never overlap.
+// Upper bound: stay below STACK_TOP-STACK_SIZE = 0x1FEF0000.
+static uint32_t s_contigAllocHead = 0x1C000000;
 
 static uint32_t ContigAlloc(uint32_t size, uint32_t alignment = 64)
 {
     s_contigAllocHead = (s_contigAllocHead + alignment - 1) & ~(alignment - 1);
+    if (s_contigAllocHead + size > (uint32_t)X86_RAM_SIZE) {
+        fprintf(stderr,
+            "[ContigAlloc] OVERFLOW: head=0x%08X size=0x%X would exceed RAM limit 0x%08X!\n",
+            s_contigAllocHead, size, (uint32_t)X86_RAM_SIZE);
+        return 0;
+    }
     uint32_t addr = s_contigAllocHead;
     s_contigAllocHead += size;
     return addr;
@@ -2895,6 +2914,31 @@ static float g_nv2aVpTranslateY = 0.0f;
 static void WalkPushBuffer(uint8_t* base) {
     // Walk the HLE shader-constant ring (0x35D6A0).
     uint32_t pbPut = X86_MEM_READ_u32(base, 0x35D6A0u);
+
+    // ---- Safety: pbPut must be within guest RAM and within the HLE ring ----
+    // If it's outside, the ring pointer was corrupted by some code path we
+    // haven't intercepted yet.  Reset it and bail so we don't crash.
+    {
+        bool oob = (pbPut >= (uint32_t)X86_RAM_SIZE);
+        bool outOfRing = g_pbGuestBase != 0 &&
+                         (pbPut < g_pbGuestBase || pbPut > g_pbGuestBase + g_pbGuestSize);
+        if (oob || outOfRing) {
+            static int s_pbOobLog = 0;
+            if (s_pbOobLog++ < 10) {
+                fprintf(stderr,
+                    "[PB] WARN: pbPut=0x%08X outside ring [0x%08X,0x%08X] "
+                    "(RAM=0x%08X) — ring corrupted, resetting.\n",
+                    pbPut, g_pbGuestBase, g_pbGuestBase + g_pbGuestSize,
+                    (uint32_t)X86_RAM_SIZE);
+                x86_print_host_stack("PB-WARN", 2, 32);
+            }
+            uint32_t safe = g_pbGuestBase ? g_pbGuestBase : 0u;
+            X86_MEM_WRITE_u32(base, 0x35D6A0u, safe);
+            s_pbLastWalked = safe;
+            return;
+        }
+    }
+
     if (s_pbLastWalked == 0) { s_pbLastWalked = pbPut; }
     if (pbPut <  s_pbLastWalked) { s_pbLastWalked = pbPut; } // wrap
     // Walk the separate IM ring (addr 0, used by recompiled sub_3DA90).
@@ -2995,6 +3039,8 @@ static void WalkPushBuffer(uint8_t* base) {
         case 0x0B80: // NV2A_VP_UPLOAD_CONST(0) — N*4 DWORDs of float4s,
                      // auto-incrementing curConstAddr.
             for (uint32_t i = 0; i + 4 <= count; i += 4) {
+                // Belt-and-suspenders: payload + 16 bytes must be in guest RAM.
+                if ((uint64_t)p + i * 4 + 16 > (uint64_t)X86_RAM_SIZE) break;
                 NV2A_UploadConst(base, curConstAddr,
                                  base + p + i * 4);
                 curConstAddr++;
@@ -5770,8 +5816,22 @@ void D3DDevice_Release(X86Context& ctx, uint8_t* base) {
 }
 
 void D3DDevice_BeginVisibilityTest(X86Context& ctx, uint8_t* base) {
-    static bool logged = false;
-    if (!logged) { fprintf(stderr, "[HLE-STUB] D3DDevice_BeginVisibilityTest (0x0034DF40) called\n"); logged = true; }
+    // No arguments.  Start a new D3D11 occlusion query.
+    // If a previous Begin was never paired with an End, release it now.
+    if (g_visActiveQuery) {
+        if (g_d3d11.context) g_d3d11.context->End(g_visActiveQuery);
+        g_visActiveQuery->Release();
+        g_visActiveQuery = nullptr;
+    }
+    if (g_d3d11.device && g_d3d11.context) {
+        D3D11_QUERY_DESC qd = { D3D11_QUERY_OCCLUSION, 0 };
+        ID3D11Query* q = nullptr;
+        if (SUCCEEDED(g_d3d11.device->CreateQuery(&qd, &q))) {
+            g_d3d11.context->Begin(q);
+            g_visActiveQuery = q;
+        }
+    }
+    GuestReturn32(ctx, 0); // S_OK
     GuestStackCleanup(ctx, 0);
 }
 
@@ -5782,14 +5842,56 @@ void D3D_GetVisibilityAddress(X86Context& ctx, uint8_t* base) {
 }
 
 void D3DDevice_EndVisibilityTest(X86Context& ctx, uint8_t* base) {
-    static bool logged = false;
-    if (!logged) { fprintf(stderr, "[HLE-STUB] D3DDevice_EndVisibilityTest (0x0034DFE0) called\n"); logged = true; }
+    // __usercall: index is in EAX.  No stack args; callee cleanup = 0.
+    uint32_t index = ctx.eax;
+    if (g_visActiveQuery && g_d3d11.context) {
+        g_d3d11.context->End(g_visActiveQuery);
+        auto& slot = g_visSlots[index];
+        if (slot.query) slot.query->Release();
+        slot.query = g_visActiveQuery;
+        slot.count = 0;
+        slot.ready = false;
+        g_visActiveQuery = nullptr;
+    }
+    GuestReturn32(ctx, 0); // S_OK
     GuestStackCleanup(ctx, 0);
 }
 
 void D3DDevice_GetVisibilityTestResult(X86Context& ctx, uint8_t* base) {
-    static bool logged = false;
-    if (!logged) { fprintf(stderr, "[HLE-STUB] D3DDevice_GetVisibilityTestResult (0x0034E040) called\n"); logged = true; }
+    // __userpurge: a1(index) in EAX, a2(pResult[2]) in EDX, a3(pCount) on stack.
+    // Returns S_OK (0) on success, 0x88760028 if the result is not yet ready.
+    uint32_t index  = ctx.eax;
+    uint32_t a2Ptr  = ctx.edx;               // optional DWORD[2] out (fence info)
+    uint32_t a3Ptr  = GuestArg32(ctx, base, 0); // required DWORD out (pixel count)
+
+    auto it = g_visSlots.find(index);
+    if (it != g_visSlots.end() && it->second.query && g_d3d11.context) {
+        auto& slot = it->second;
+        if (!slot.ready) {
+            UINT64 data = 0;
+            HRESULT hr = g_d3d11.context->GetData(slot.query, &data, sizeof(data), 0);
+            if (hr == S_FALSE) {
+                // Result not yet available — return Xbox "not ready" HRESULT.
+                GuestReturn32(ctx, 0x88760028u);
+                GuestStackCleanup(ctx, 4);
+                return;
+            }
+            if (SUCCEEDED(hr)) {
+                slot.count = data;
+                slot.ready = true;
+            }
+        }
+        if (a3Ptr) X86_MEM_WRITE_u32(base, a3Ptr, (uint32_t)slot.count);
+    } else {
+        // No query for this slot — treat as fully visible.
+        if (a3Ptr) X86_MEM_WRITE_u32(base, a3Ptr, 1u);
+    }
+    // a2 carries Xbox fence/timing info we don't emulate; zero it if present.
+    if (a2Ptr) {
+        X86_MEM_WRITE_u32(base, a2Ptr,     0u);
+        X86_MEM_WRITE_u32(base, a2Ptr + 4, 0u);
+    }
+    GuestReturn32(ctx, 0); // S_OK
     GuestStackCleanup(ctx, 4);
 }
 
@@ -6648,7 +6750,8 @@ static ID3D11ShaderResourceView* GetOrCreateTextureSRV(uint8_t* base, uint32_t x
 {
     if (!g_d3d11.initialized || xboxTexAddr == 0) return nullptr;
 
-    uint32_t dataAddr  = X86_MEM_READ_u32(base, xboxTexAddr + 4);
+    // Strip Xbox physical-address flag bits (high nibble), same as ResolveNV2ATextureSRV.
+    uint32_t dataAddr  = X86_MEM_READ_u32(base, xboxTexAddr + 4) & 0x0FFFFFFFu;
     uint32_t fmtField  = X86_MEM_READ_u32(base, xboxTexAddr + 12);
     uint32_t sizeField = X86_MEM_READ_u32(base, xboxTexAddr + 16);
     if (dataAddr == 0) return nullptr;
@@ -6931,6 +7034,15 @@ static ID3D11ShaderResourceView* GetOrCreateTextureSRV(uint8_t* base, uint32_t x
         }
     };
 
+    // Guard: ensure the texture data fits within guest RAM before copying.
+    if ((uint64_t)dataAddr + (uint64_t)numFaces * srcFaceBytes > X86_RAM_SIZE) {
+        static int s_oobLog = 0;
+        if (s_oobLog < 8)
+            fprintf(stderr, "[D3D11] tex data OOB: addr=0x%08X faces=%u faceBytes=0x%X\n",
+                    dataAddr, numFaces, srcFaceBytes);
+        ++s_oobLog;
+        return nullptr;
+    }
     for (uint32_t f = 0; f < numFaces; ++f) {
         buildFace(dataAddr + f * srcFaceBytes, faceBufs[f]);
     }
@@ -7842,23 +7954,6 @@ static bool BindTranslatedPSFor2D(uint8_t* base, TranslatedPS* tps)
     ID3D11ShaderResourceView* srvs[4]  = {};
     ID3D11SamplerState*       samps[4] = {};
 
-    // Diagnostic: log live vs snapshot texture addresses for the blur PSes
-    static bool s_bindDiagDone[2] = {};
-    {
-        int psSlot = (g_currentPSHandle == 0x00900000u) ? 0 : (g_currentPSHandle == 0x00901000u) ? 1 : -1;
-        if (psSlot >= 0 && !s_bindDiagDone[psSlot]) {
-            s_bindDiagDone[psSlot] = true;
-            for (unsigned s = 0; s < 4; ++s) {
-                uint32_t liveA = base ? X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + s * 4) : 0;
-                uint32_t snapA = g_psTexHandleSnapshot[s];
-                uint32_t usedA = (s == 0) ? (liveA ? liveA : snapA) : (snapA ? snapA : liveA);
-                bool inParent  = g_d3d11.guestRTByParent.count(usedA) != 0;
-                fprintf(stderr, "[BIND-TPS] PS=0x%08X stage=%u snap=0x%08X live=0x%08X used=0x%08X inParent=%d src=%d\n",
-                        g_currentPSHandle, s, snapA, liveA, usedA, (int)inParent, g_texBoundSource[s]);
-            }
-        }
-    }
-
     for (unsigned s = 0; s < 4; ++s) {
         ID3D11ShaderResourceView* stageSrv = nullptr;
         if (tps->usesStage[s]) {
@@ -8460,7 +8555,12 @@ static void HLE_Draw3D(uint8_t* base,
     // D3DResource header stores the raw data pointer at +4 (virtual address).
     uint32_t vbData = X86_MEM_READ_u32(base, vbRes + 4);
     if (vbData == 0) vbData = vbRes + 0x0C; // fallback: inline data
-    vbData &= 0x3FFFFFFFu;
+    vbData &= (uint32_t)(X86_RAM_SIZE - 1u);
+    if (vbData == 0 || vbData >= (uint32_t)X86_RAM_SIZE) {
+        fprintf(stderr, "[HLE_Draw3D] invalid vbData=0x%08X (vbRes=0x%08X), skipping draw\n",
+                vbData, vbRes);
+        return;
+    }
 
     // Determine how many unique vertices we need to upload.
     //
@@ -9270,41 +9370,6 @@ static void DrawSWVertsWithTexD3D11(uint8_t* base, const SWVertex* sv, size_t n,
         }
     }
 
-    // Bloom diagnostic: log IM draws when RT or texture is in the bloom range.
-    if (rtSurf == 0 || (rtSurf >= 0x19200000u && rtSurf < 0x19300000u)
-        || (texAddr0 >= 0x4D0000u && texAddr0 < 0x4E0000u)) {
-        uint32_t data0 = texAddr0 ? X86_MEM_READ_u32(base, texAddr0 + 4) : 0;
-        bool rtInMap   = g_d3d11.guestRTBySurface.count(rtSurf) != 0;
-        fprintf(stderr,
-                "[BLOOM] IM-End f=%u rt=0x%08X(inMap=%d) tex=0x%08X data=0x%08X"
-                " srv=%s n=%zu prim=%d PS=0x%08X useT=%d\n",
-                g_ppFrame, rtSurf, (int)rtInMap, texAddr0, data0,
-                srv ? "YES" : "NULL", n, primType, g_currentPSHandle, (int)useTexture);
-        // Dump raw SWVertex UV data (first time per PS) so we can see what's
-        // happening to V before the /g_bbHeight normalization in DrawSWVertsD3D11.
-        static uint32_t s_bloomVtxDone = 0;
-        uint32_t mask = (g_currentPSHandle == 0x008FC000u) ? 1u :
-                        (g_currentPSHandle == 0x008FD000u) ? 2u :
-                        (g_currentPSHandle == 0x008FE000u) ? 4u :
-                        (g_currentPSHandle == 0x008FF000u) ? 8u : 0u;
-        if (mask && !(s_bloomVtxDone & mask)) {
-            s_bloomVtxDone |= mask;
-            uint32_t vpW2 = base ? X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 8)  : 0;
-            uint32_t vpH2 = base ? X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 12) : 0;
-            fprintf(stderr, "[BLOOM-VTX] PS=0x%08X bbW=%u bbH=%u vpW=%u vpH=%u srcTexW=%u srcTexH=%u n=%zu:\n",
-                    g_currentPSHandle, g_bbWidth, g_bbHeight, vpW2, vpH2,
-                    (texAddr0 && g_d3d11.guestRTBySurface.count(texAddr0) && g_d3d11.guestRTBySurface.at(texAddr0).rt)
-                        ? g_d3d11.guestRTBySurface.at(texAddr0).rt->baseW : 0u,
-                    (texAddr0 && g_d3d11.guestRTBySurface.count(texAddr0) && g_d3d11.guestRTBySurface.at(texAddr0).rt)
-                        ? g_d3d11.guestRTBySurface.at(texAddr0).rt->baseH : 0u,
-                    n);
-            for (size_t vi = 0; vi < n && vi < 4; vi++) {
-                fprintf(stderr, "  [%zu] pos=(%.3f,%.3f) uv=(%.4f,%.4f) diff=0x%08X\n",
-                        vi, sv[vi].x, sv[vi].y, sv[vi].u, sv[vi].v, sv[vi].diffuse);
-            }
-        }
-    }
-
     // Look up source texture dimensions so DrawSWVertsD3D11 uses the correct
     // UV normalization divisor (rather than the global g_bbWidth/g_bbHeight
     // which is always 640x480, even when the source RT is 320x240 or 160x120).
@@ -9557,77 +9622,6 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
     bool useTexture = (g_currentPSHandle != 0 || ColorOpUsesTexture());
     ID3D11ShaderResourceView* srv = nullptr;
 
-    // Diagnostic: log DrawVerticesUP draws for blur investigation.
-    if (g_currentPSHandle == 0x00900000u || g_currentPSHandle == 0x00901000u) {
-        uint32_t dataAddr = texAddr ? X86_MEM_READ_u32(base, texAddr + 4) : 0;
-        uint32_t rtSurf   = g_d3d11.currentRTSurf;
-        bool rtInMap = g_d3d11.guestRTBySurface.count(rtSurf) != 0;
-        auto psIt = g_psByHandle.find(g_currentPSHandle);
-        bool tpsOk = (psIt != g_psByHandle.end() && psIt->second.ps != nullptr);
-        uint32_t snap1 = g_psTexHandleSnapshot[1];
-        uint32_t snap2 = g_psTexHandleSnapshot[2];
-        uint32_t snap3 = g_psTexHandleSnapshot[3];
-        uint32_t vpW_diag = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 8);
-        uint32_t vpH_diag = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 12);
-        fprintf(stderr,
-                "[DVUP2] f=%u rt=0x%08X(inMap=%d) tex=0x%08X data=0x%08X"
-                " prim=%u vtxCnt=%u stride=%u PS=0x%08X tpsOk=%d"
-                " snap0=0x%08X snap1=0x%08X snap2=0x%08X snap3=0x%08X"
-                " vp=%ux%u nv2aVp=(sx=%.1f sy=%.1f tx=%.1f ty=%.1f) blend:en=%d src=%u dst=%u\n",
-                g_ppFrame, rtSurf, (int)rtInMap, texAddr, dataAddr,
-                primType, vtxCount, vtxStride, g_currentPSHandle, (int)tpsOk,
-                texAddr, snap1, snap2, snap3, vpW_diag, vpH_diag,
-                g_nv2aVpScaleX, g_nv2aVpScaleY, g_nv2aVpTranslateX, g_nv2aVpTranslateY,
-                (int)g_alphaBlendEnabled, g_blendSrc, g_blendDst);
-        // Dump raw vertex data for first 4 vertices so we can verify position/UV values.
-        if (vtxStride == 52 && vtxCount >= 1) {
-            for (uint32_t vi = 0; vi < vtxCount && vi < 4; vi++) {
-                uint32_t off = pVtxData + vi * 52;
-                float vx, vy, vz, vw, u0, v0, u1, v1, u2, v2, u3, v3;
-                memcpy(&vx, base + off +  0, 4); memcpy(&vy, base + off +  4, 4);
-                memcpy(&vz, base + off +  8, 4); memcpy(&vw, base + off + 12, 4);
-                memcpy(&u0, base + off + 20, 4); memcpy(&v0, base + off + 24, 4);
-                memcpy(&u1, base + off + 28, 4); memcpy(&v1, base + off + 32, 4);
-                memcpy(&u2, base + off + 36, 4); memcpy(&v2, base + off + 40, 4);
-                memcpy(&u3, base + off + 44, 4); memcpy(&v3, base + off + 48, 4);
-                uint32_t vcol = X86_MEM_READ_u32(base, off + 16);
-                fprintf(stderr,
-                        "[DVUP2-VTX%u] pos=(%.1f,%.1f,%.3f,%.3f) col=0x%08X"
-                        " uv0=(%.3f,%.3f) uv1=(%.3f,%.3f) uv2=(%.3f,%.3f) uv3=(%.3f,%.3f)\n",
-                        vi, vx, vy, vz, vw, vcol,
-                        u0, v0, u1, v1, u2, v2, u3, v3);
-            }
-        }
-    }
-    // Diagnostic: log bloom chain downsampling draws (PS=0x008FD000/0x008FE000/0x008FF000).
-    // These feed into the blur draw's stage1 (0x004D6A48), so their UV handling matters.
-    if (g_currentPSHandle == 0x008FD000u || g_currentPSHandle == 0x008FE000u ||
-        g_currentPSHandle == 0x008FF000u || g_currentPSHandle == 0x008FC000u) {
-        static bool s_bloomDiagDone[4] = {};
-        int slot = (g_currentPSHandle == 0x008FC000u) ? 0 :
-                   (g_currentPSHandle == 0x008FD000u) ? 1 :
-                   (g_currentPSHandle == 0x008FE000u) ? 2 : 3;
-        if (!s_bloomDiagDone[slot]) {
-            s_bloomDiagDone[slot] = true;
-            uint32_t rtSurf = g_d3d11.currentRTSurf;
-            fprintf(stderr, "[BLOOM-CHAIN] PS=0x%08X rt=0x%08X stride=%u vtxCnt=%u\n",
-                    g_currentPSHandle, rtSurf, vtxStride, vtxCount);
-            for (uint32_t vi = 0; vi < vtxCount && vi < 4; vi++) {
-                uint32_t off = pVtxData + vi * vtxStride;
-                float vx, vy;
-                memcpy(&vx, base + off + 0, 4); memcpy(&vy, base + off + 4, 4);
-                // Read UVs from the most likely offsets based on stride
-                float ua = 0, va = 0;
-                if (vtxStride == 28) {
-                    memcpy(&ua, base + off + 20, 4); memcpy(&va, base + off + 24, 4);
-                } else if (vtxStride >= 20) {
-                    memcpy(&ua, base + off + 8,  4); memcpy(&va, base + off + 12, 4);
-                }
-                fprintf(stderr, "[BLOOM-CHAIN-VTX%u] pos=(%.2f,%.2f) uv=(%.4f,%.4f)\n",
-                        vi, vx, vy, ua, va);
-            }
-        }
-    }
     bool isAlphaOnly = false;
     uint32_t texW = 1, texH = 1;
     
@@ -9756,19 +9750,6 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
             uvAff[2] = { 0.f, 320.f, 0.f, 240.f };
             // uvAff[3]: intentionally shared (vertex-derived)
         }
-
-        // One-time diagnostic
-        static bool s_uvDiagDone[2] = {};
-        int psSlot = (g_currentPSHandle == 0x00900000u) ? 0 : (g_currentPSHandle == 0x00901000u) ? 1 : -1;
-        if (psSlot >= 0 && !s_uvDiagDone[psSlot]) {
-            s_uvDiagDone[psSlot] = true;
-            fprintf(stderr, "[DVUP2-UVAFFINE] PS=0x%08X isCentered=%d "
-                    "s0 uOff=%.2f uRng=%.2f vOff=%.2f vRng=%.2f | "
-                    "s1 uOff=%.2f uRng=%.2f vOff=%.2f vRng=%.2f\n",
-                    g_currentPSHandle, (int)isCentered,
-                    uvAff[0].uOff, uvAff[0].uRng, uvAff[0].vOff, uvAff[0].vRng,
-                    uvAff[1].uOff, uvAff[1].uRng, uvAff[1].vOff, uvAff[1].vRng);
-        }
     }
 
     // Build normalized Vtx2D array (and optional Vtx2DEx for stride=52 TPS draws)
@@ -9834,47 +9815,6 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
             }
         }
         v2d[i] = {x, y, u, v, col};
-    }
-
-    // Post-normalization diagnostic for blur draw: print actual GPU-bound UV values
-    // AND the active PS constant blend weights. Together these uniquely determine
-    // the streak direction and intensity that the GPU will produce.
-    if (g_currentPSHandle == 0x00900000u && buildExVerts && !v2dEx.empty()) {
-        static bool s_postNormDone = false;
-        if (!s_postNormDone) {
-            s_postNormDone = true;
-            // Print first and last vertex (all 4 UV stages) to verify top/bottom.
-            const Vtx2DEx& fe = v2dEx.front();
-            const Vtx2DEx& le = v2dEx.back();
-            fprintf(stderr,
-                    "[DVUP2-POSTNORM] first: pos=(%.1f,%.1f)"
-                    " s0=(%.4f,%.4f) s1=(%.4f,%.4f) s2=(%.4f,%.4f) s3=(%.4f,%.4f)\n",
-                    fe.x, fe.y,
-                    fe.u0, fe.v0, fe.u1, fe.v1, fe.u2, fe.v2, fe.u3, fe.v3);
-            fprintf(stderr,
-                    "[DVUP2-POSTNORM] last:  pos=(%.1f,%.1f)"
-                    " s0=(%.4f,%.4f) s1=(%.4f,%.4f) s2=(%.4f,%.4f) s3=(%.4f,%.4f)\n",
-                    le.x, le.y,
-                    le.u0, le.v0, le.u1, le.v1, le.u2, le.v2, le.u3, le.v3);
-            // psC[0].a = stage0 blend weight (scene vs bloom).
-            // psC[1].a = stage1 blend weight applied to r0.
-            // psC[2].a = final-combiner scale (fc0) for this shader.
-            fprintf(stderr,
-                    "[DVUP2-POSTNORM] psC[0].a=%.4f psC[1].a=%.4f psC[2].a=%.4f\n",
-                    g_pshConstants[0][3], g_pshConstants[1][3], g_pshConstants[2][3]);
-        }
-    }
-    // Post-normalization diagnostic for composite draw: print blend weights.
-    if (g_currentPSHandle == 0x00901000u && buildExVerts && !v2dEx.empty()) {
-        static bool s_compNormDone = false;
-        if (!s_compNormDone) {
-            s_compNormDone = true;
-            // psC[0].a = weight for blur RT (stage0: blurRT vs scene).
-            // psC[1].a = weight for stage1 blend (accumulated vs scene[uv2]).
-            fprintf(stderr,
-                    "[DVUP2-COMPNORM] psC[0].a=%.4f psC[1].a=%.4f\n",
-                    g_pshConstants[0][3], g_pshConstants[1][3]);
-        }
     }
 
     // Map NV2A primitive types to D3D11 topology (expand fans/quads)
@@ -10260,14 +10200,23 @@ void D3DDevice_IsFencePending(X86Context& ctx, uint8_t* base) {
 }
 
 void D3DDevice_BeginPush(X86Context& ctx, uint8_t* base) {
-    static bool logged = false;
-    if (!logged) { fprintf(stderr, "[HLE-STUB] D3DDevice_BeginPush (0x00351C20) called\n"); logged = true; }
+    // Ensure the IM push-buffer ring is allocated.
+    EnsureIMPushBuffer(base);
+    // The original reads pDevice = [0x35FB48] (= 0 in our setup) then
+    // returns m_pPush = [pDevice] as the write pointer.  We always reset
+    // the ring to its base so callers write into safe IM-ring memory instead
+    // of whatever stale ctx.eax happened to hold.
+    uint32_t pDevice = X86_MEM_READ_u32(base, 0x35FB48u);  // = 0
+    X86_MEM_WRITE_u32(base, pDevice, g_pbIMBase);           // Reset IM ring PUT
+    ctx.eax = g_pbIMBase;
     GuestStackCleanup(ctx, 4);
 }
 
 void D3DDevice_EndPush(X86Context& ctx, uint8_t* base) {
-    static bool logged = false;
-    if (!logged) { fprintf(stderr, "[HLE-STUB] D3DDevice_EndPush (0x00351C80) called\n"); logged = true; }
+    // The original writes new_put = [esp+4] back into [pDevice] = [0].
+    uint32_t newPut  = GuestArg32(ctx, base, 0);
+    uint32_t pDevice = X86_MEM_READ_u32(base, 0x35FB48u);  // = 0
+    X86_MEM_WRITE_u32(base, pDevice, newPut);
     GuestStackCleanup(ctx, 4);
 }
 
