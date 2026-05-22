@@ -6756,17 +6756,20 @@ static ID3D11ShaderResourceView* GetOrCreateTextureSRV(uint8_t* base, uint32_t x
     uint32_t sizeField = X86_MEM_READ_u32(base, xboxTexAddr + 16);
     if (dataAddr == 0) return nullptr;
 
-    // Detect if this dataAddr belongs to the back buffer for Post-FX
+    // Detect if this dataAddr belongs to the back buffer for Post-FX.
+    // Both sides of the comparison must be masked the same way as dataAddr so
+    // that ContigAlloc pixel-buffer addresses in the 0x1C000000+ range
+    // (high nibble non-zero after 28-bit mask) still compare equal.
     uint32_t activeRTData = 0;
     uint32_t rtAddr = g_d3d11.currentRTSurf;
     if (rtAddr == 0) rtAddr = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceRenderTarget);
     if (rtAddr == 0) rtAddr = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceBackBufBase);
-    if (rtAddr != 0) activeRTData = X86_MEM_READ_u32(base, rtAddr + 4);
+    if (rtAddr != 0) activeRTData = X86_MEM_READ_u32(base, rtAddr + 4) & 0x0FFFFFFFu;
 
     for (int i = 0; i < 4; ++i) {
         uint32_t bbAddr = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceBackBufBase + i * 4);
         if (bbAddr != 0) {
-            uint32_t bbData = X86_MEM_READ_u32(base, bbAddr + 4);
+            uint32_t bbData = X86_MEM_READ_u32(base, bbAddr + 4) & 0x0FFFFFFFu;
             if (dataAddr == bbData) {
                 if (dataAddr == activeRTData) {
                     return g_d3d11.sceneSRV; // Active RT => feedback loop (Hazard mitigation uses scratch)
