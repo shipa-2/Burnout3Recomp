@@ -53,6 +53,7 @@
 
 // D3D11 hardware rendering
 #include <d3d11.h>
+#include <d3d11_1.h>     // ID3DUserDefinedAnnotation (RenderDoc markers)
 #include <dxgi.h>
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3d11.lib")
@@ -74,6 +75,18 @@ struct VsCacheEntry {
     std::string         hlsl;                 // kept for first-use diagnostic
 };
 static std::unordered_map<uint32_t, VsCacheEntry> g_vsByHandle;
+
+// Occlusion / visibility test query pool.
+// Xbox API: BeginVisibilityTest() starts accumulating; EndVisibilityTest(index)
+// ends and tags the result at 'index'; GetVisibilityTestResult(index,...)
+// reads it back.  We map each index to a D3D11 D3D11_QUERY_OCCLUSION query.
+struct VisibilitySlot {
+    ID3D11Query* query = nullptr;
+    UINT64       count = 0;
+    bool         ready = false;
+};
+static ID3D11Query*                               g_visActiveQuery = nullptr;
+static std::unordered_map<uint32_t, VisibilitySlot> g_visSlots;
 
 // Forward declaration — D3DCompile wrapper defined much later in this file.
 static ID3DBlob* D3D11CompileShader(const char* hlsl, const char* entry, const char* target);
@@ -112,21 +125,69 @@ static void SetD3DName(IDXGIObject* obj, const char* fmt, ...)
 // HLSL Shaders
 // ============================================================================
 
-// 2D vertex shader: screen-space XYZRHW → clip space
-// Constant buffer slot 0: float2 screenSize    
+// 2D vertex shader: screen-space XYZRHW → clip space, single UV replicated to all stages
 static const char s_vsHlsl[] =
-    "cbuffer CB : register(b0) { float2 screenSize; float2 pad; }\n"
+    "cbuffer CB : register(b0) { float2 screenSize; float2 screenOffset; }\n"
     "struct VS_IN { float2 pos : POSITION; float2 uv : TEXCOORD; float4 col : COLOR; };\n"
-    "struct VS_OUT { float4 pos : SV_POSITION; float4 oD0 : COLOR0; float4 oD1 : COLOR1; float4 oFog : FOG;\n"
-    "  float4 oT0 : TEXCOORD0; float4 oT1 : TEXCOORD1; float4 oT2 : TEXCOORD2; float4 oT3 : TEXCOORD3; };\n"
+    "struct VS_OUT {\n"
+    "  float4 pos  : SV_POSITION;\n"
+    "  float4 oD0  : COLOR0;\n"
+    "  float4 oD1  : COLOR1;\n"
+    "  float4 oFog : FOG;\n"
+    "  float4 oT0  : TEXCOORD0;\n"
+    "  float4 oT1  : TEXCOORD1;\n"
+    "  float4 oT2  : TEXCOORD2;\n"
+    "  float4 oT3  : TEXCOORD3;\n"
+    "};\n"
     "VS_OUT main(VS_IN v) {\n"
     "  VS_OUT o;\n"
-    "  o.pos.x =  (v.pos.x / screenSize.x) * 2.0f - 1.0f;\n"
-    "  o.pos.y = -(v.pos.y / screenSize.y) * 2.0f + 1.0f;\n"
+    "  o.pos.x =  ((v.pos.x - screenOffset.x) / screenSize.x) * 2.0f - 1.0f;\n"
+    "  o.pos.y = -((v.pos.y - screenOffset.y) / screenSize.y) * 2.0f + 1.0f;\n"
     "  o.pos.z = 0.0f; o.pos.w = 1.0f;\n"
-    "  o.oD0 = v.col; o.oD1 = float4(0,0,0,0); o.oFog = float4(1,1,1,1);\n"
-    "  o.oT0 = float4(v.uv, 0.0f, 1.0f); o.oT1 = float4(v.uv, 0.0f, 1.0f);\n"
-    "  o.oT2 = float4(v.uv, 0.0f, 1.0f); o.oT3 = float4(v.uv, 0.0f, 1.0f);\n"
+    "  o.oD0 = v.col;\n"
+    "  o.oD1 = float4(0,0,0,0);\n"
+    "  o.oFog = float4(1,1,1,1);\n"
+    "  o.oT0 = float4(v.uv, 0, 1);\n"
+    "  o.oT1 = float4(v.uv, 0, 1);\n"
+    "  o.oT2 = float4(v.uv, 0, 1);\n"
+    "  o.oT3 = float4(v.uv, 0, 1);\n"
+    "  return o;\n"
+    "}\n";
+
+// Extended 2D vertex shader: 4 independent UV channels for multi-sample post-FX (blur, etc.)
+// Vertex layout: pos(xy) + uv0..uv3(4×xy) + col(rgba) = 44 bytes
+static const char s_vsExHlsl[] =
+    "cbuffer CB : register(b0) { float2 screenSize; float2 screenOffset; }\n"
+    "struct VS_IN {\n"
+    "  float2 pos  : POSITION;\n"
+    "  float2 uv0  : TEXCOORD0;\n"
+    "  float2 uv1  : TEXCOORD1;\n"
+    "  float2 uv2  : TEXCOORD2;\n"
+    "  float2 uv3  : TEXCOORD3;\n"
+    "  float4 col  : COLOR;\n"
+    "};\n"
+    "struct VS_OUT {\n"
+    "  float4 pos  : SV_POSITION;\n"
+    "  float4 oD0  : COLOR0;\n"
+    "  float4 oD1  : COLOR1;\n"
+    "  float4 oFog : FOG;\n"
+    "  float4 oT0  : TEXCOORD0;\n"
+    "  float4 oT1  : TEXCOORD1;\n"
+    "  float4 oT2  : TEXCOORD2;\n"
+    "  float4 oT3  : TEXCOORD3;\n"
+    "};\n"
+    "VS_OUT main(VS_IN v) {\n"
+    "  VS_OUT o;\n"
+    "  o.pos.x =  ((v.pos.x - screenOffset.x) / screenSize.x) * 2.0f - 1.0f;\n"
+    "  o.pos.y = -((v.pos.y - screenOffset.y) / screenSize.y) * 2.0f + 1.0f;\n"
+    "  o.pos.z = 0.0f; o.pos.w = 1.0f;\n"
+    "  o.oD0  = v.col;\n"
+    "  o.oD1  = float4(0,0,0,0);\n"
+    "  o.oFog = float4(1,1,1,1);\n"
+    "  o.oT0  = float4(v.uv0, 0, 1);\n"
+    "  o.oT1  = float4(v.uv1, 0, 1);\n"
+    "  o.oT2  = float4(v.uv2, 0, 1);\n"
+    "  o.oT3  = float4(v.uv3, 0, 1);\n"
     "  return o;\n"
     "}\n";
 
@@ -153,7 +214,8 @@ static const char s_psInDecl[] =
     "  float4 oT0 : TEXCOORD0; float4 oT1 : TEXCOORD1; float4 oT2 : TEXCOORD2; float4 oT3 : TEXCOORD3; };\n";
 
 // Untextured pixel shader: use vertex colour only
-static const std::string s_psUntexturedHlsl = std::string(s_psInDecl) +
+static const char s_psUntexturedHlsl[] =
+    "struct PS_IN { float4 pos:SV_POSITION; float4 oD0:COLOR0; float4 oD1:COLOR1; float4 oFog:FOG; float4 oT0:TEXCOORD0; float4 oT1:TEXCOORD1; float4 oT2:TEXCOORD2; float4 oT3:TEXCOORD3; };\n"
     "float4 main(PS_IN p) : SV_TARGET { return p.oD0; }\n";
 
 // 3D untextured PS: same as above but floors the vertex colour so Xbox VS
@@ -167,14 +229,18 @@ static const char s_ps3DUntexturedHlsl[] =
 
 // Alpha-only textured pixel shader: for A8/L8/P8-font textures
 // Samples the alpha channel and uses vertex colour's RGB
-static const std::string s_psAlphaHlsl = std::string("Texture2D t : register(t0); SamplerState s : register(s0);\n") + s_psInDecl +
+static const char s_psAlphaHlsl[] =
+    "Texture2D t : register(t0); SamplerState s : register(s0);\n"
+    "struct PS_IN { float4 pos:SV_POSITION; float4 oD0:COLOR0; float4 oD1:COLOR1; float4 oFog:FOG; float4 oT0:TEXCOORD0; float4 oT1:TEXCOORD1; float4 oT2:TEXCOORD2; float4 oT3:TEXCOORD3; };\n"
     "float4 main(PS_IN p) : SV_TARGET {\n"
     "  float a = t.Sample(s, p.oT0.xy).a;\n"
     "  return float4(p.oD0.rgb, p.oD0.a * a);\n"
     "}\n";
 
 // Modulate pixel shader: texture colour * vertex colour
-static const std::string s_psModulateHlsl = std::string("Texture2D t : register(t0); SamplerState s : register(s0);\n") + s_psInDecl +
+static const char s_psModulateHlsl[] =
+    "Texture2D t : register(t0); SamplerState s : register(s0);\n"
+    "struct PS_IN { float4 pos:SV_POSITION; float4 oD0:COLOR0; float4 oD1:COLOR1; float4 oFog:FOG; float4 oT0:TEXCOORD0; float4 oT1:TEXCOORD1; float4 oT2:TEXCOORD2; float4 oT3:TEXCOORD3; };\n"
     "float4 main(PS_IN p) : SV_TARGET {\n"
     "  float4 tc = t.Sample(s, p.oT0.xy);\n"
     "  return tc * p.oD0;\n"
@@ -248,6 +314,12 @@ struct RenderTargetEntry {
     uint32_t                  height   = 0;
 };
 
+struct GuestRT;
+struct GuestRTBind {
+    GuestRT* rt  = nullptr;
+    uint32_t mip = 0;
+};
+
 // Render-to-texture support: tracks a guest texture that the game writes to
 // via SetRenderTarget and later samples as a shader resource (e.g. dynamic
 // environment maps in Burnout 3 car-select).
@@ -255,12 +327,19 @@ struct GuestRT {
     ID3D11Texture2D*                       texture     = nullptr; // shared, all mips, RT+SR bound
     ID3D11ShaderResourceView*              srv         = nullptr; // full chain SRV
     std::vector<ID3D11RenderTargetView*>   rtvPerMip;             // one RTV per mip level
+    std::vector<ID3D11ShaderResourceView*> srvPerMip;
     // Per-RT-mip "source" SRV exposing only mips strictly above the bound
     // RT mip (i.e. larger / coarser-resolution mips have larger indices, so
     // these expose mips 0..M-1 when RT=mip M). Used to dodge the D3D11
     // RTV/SRV overlap hazard during bloom downsample chains, which sample
     // mip M-1 while writing to mip M of the same texture.
     std::vector<ID3D11ShaderResourceView*> srvSrcExclMip;
+    // Per-GuestRT depth buffer (sized baseW x baseH, one DSV per mip).
+    // Bound alongside the GuestRT's RTV for 3D draws so depth test works
+    // correctly when the game renders a scene into an offscreen texture
+    // (e.g. environment/reflection maps or the main render target).
+    ID3D11Texture2D*                       depthTex    = nullptr;
+    std::vector<ID3D11DepthStencilView*>   dsvPerMip;
     uint32_t                               baseW       = 0;
     uint32_t                               baseH       = 0;
     uint32_t                               mipCount    = 1;
@@ -299,6 +378,8 @@ struct D3D11State {
     ID3D11Texture2D*          backBufferTex  = nullptr;  // alias: sceneTex
     ID3D11RenderTargetView*   backBufferRTV  = nullptr;  // alias: sceneRTV
     ID3D11ShaderResourceView* sceneSRV       = nullptr;
+    ID3D11Texture2D*          prevSceneTex   = nullptr;
+    ID3D11ShaderResourceView* prevSceneSRV   = nullptr;
     ID3D11Texture2D*          swapChainTex   = nullptr;
     ID3D11RenderTargetView*   swapChainRTV   = nullptr;
     DXGI_FORMAT               sceneFormat    = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -311,8 +392,9 @@ struct D3D11State {
     // 2D Pipeline
     ID3D11VertexShader*       vs2D           = nullptr;
     ID3D11InputLayout*        il2D           = nullptr;
-    ID3D11VertexShader*       vs2D_RHW       = nullptr;
-    ID3D11InputLayout*        il2D_RHW       = nullptr;
+    // Extended 2D pipeline: 4 independent UV channels for multi-sample post-FX
+    ID3D11VertexShader*       vs2DEx         = nullptr;
+    ID3D11InputLayout*        il2DEx         = nullptr;
     ID3D11PixelShader*        psUntextured   = nullptr;
     ID3D11PixelShader*        psAlpha        = nullptr;
     ID3D11PixelShader*        psModulate     = nullptr;
@@ -351,7 +433,7 @@ struct D3D11State {
     // Render-to-texture: per-parent guest texture (keyed by parent texture
     // header addr) and per-surface RTV binding (keyed by surface addr).
     std::unordered_map<uint32_t, GuestRT*>          guestRTByParent;
-    std::unordered_map<uint32_t, GuestRT*>          guestRTByDataAddr;
+    std::unordered_map<uint32_t, GuestRTBind>       guestRTByDataAddr;
     std::unordered_map<uint32_t, SurfaceRTBind>     guestRTBySurface;
     uint32_t                                        currentRTSurf = 0; // 0 = back buffer
     GuestRT*                                        activeGuestRT = nullptr; // currently bound (or nullptr = back buffer)
@@ -360,13 +442,29 @@ struct D3D11State {
     uint32_t                  xboxBBSurf     = 0;
     uint32_t                  xboxBBSurf2    = 0;
 
+    // ---- RenderDoc / PIX annotation ----
+    ID3DUserDefinedAnnotation* annotation    = nullptr;  // SetMarker per draw
+
     // ---- Debug instrumentation (env-gated; see g_dbg) ----
     ID3D11PixelShader*        psDebugColor   = nullptr;  // outputs per-draw unique color
     ID3D11Buffer*             cbDebug        = nullptr;  // float4: drawIdx, flags, pad, pad
     ID3D11RasterizerState*    rsWire         = nullptr;  // wireframe + no-cull + no depth-clip
+
+    // Scratch texture for in-place RT read/write hazard mitigation (motion blur, etc.)
+    ID3D11Texture2D*          scratchTex       = nullptr;
+    ID3D11ShaderResourceView* scratchSRV       = nullptr;
+    uint32_t                  scratchW         = 0;
+    uint32_t                  scratchH         = 0;
+    DXGI_FORMAT               scratchFmt       = DXGI_FORMAT_UNKNOWN;
 };
 
 static D3D11State g_d3d11;
+
+// Emit a RenderDoc / PIX marker visible in the event browser.
+// Format example: f=1195 d=042 RT=192580C0 IM/QUAD 4v
+static void RdocMark(const wchar_t* label) {
+    if (g_d3d11.annotation) g_d3d11.annotation->SetMarker(label);
+}
 
 // Forward decls for render-to-texture helpers (definitions live further down).
 static GuestRT* EnsureGuestRT(uint8_t* base, uint32_t parentTexAddr);
@@ -740,6 +838,7 @@ static constexpr uint32_t X_D3DFMT_DXT3         = 0x0E;
 static constexpr uint32_t X_D3DFMT_DXT5         = 0x0F;
 static constexpr uint32_t X_D3DFMT_LIN_A8R8G8B8 = 0x12;
 static constexpr uint32_t X_D3DFMT_LIN_X8R8G8B8 = 0x1E;
+static constexpr uint32_t X_D3DFMT_G8B8         = 0x28;
 
 // Pixel container format field masks
 static constexpr uint32_t X_D3DFORMAT_FORMAT_MASK  = 0x0000FF00;
@@ -778,16 +877,55 @@ static constexpr uint32_t kDeviceDepthStencil = 0x1A08;
 // (+0xCA0..0xCDF) which engine code reads via D3D_pDevice.
 static constexpr uint32_t kDeviceViewport     = 0x1E00;  // D3DVIEWPORT8: X,Y,W,H,MinZ,MaxZ
 
+// Xbox NV2A primitive types used by RenderWare im2d
+static constexpr uint32_t NV2A_PRIM_POINTS      = 1;
+static constexpr uint32_t NV2A_PRIM_LINES       = 2;
+static constexpr uint32_t NV2A_PRIM_LINESTRIP   = 3;
+static constexpr uint32_t NV2A_PRIM_TRIANGLES   = 5;
+static constexpr uint32_t NV2A_PRIM_TRISTRIP    = 6;
+static constexpr uint32_t NV2A_PRIM_TRIFAN      = 7;
+static constexpr uint32_t NV2A_PRIM_QUADS       = 8;
+static constexpr uint32_t NV2A_PRIM_QUADSTRIP   = 9;
+
+static bool IsRTFormat(uint8_t xFmt) {
+    switch (xFmt) {
+    case X_D3DFMT_A8R8G8B8: case X_D3DFMT_LIN_A8R8G8B8:
+    case X_D3DFMT_X8R8G8B8: case X_D3DFMT_LIN_X8R8G8B8:
+    case X_D3DFMT_R5G6B5:   case 0x1C: // LIN_R5G6B5
+    case X_D3DFMT_A1R5G5B5: case 0x1D: // LIN_A1R5G5B5
+    case X_D3DFMT_A4R4G4B4:
+    case 0x17: // LIN_G8B8
+    case 0x11: // G8B8
+    case 0x19: // LIN_A8
+    case 0x01: // AL8
+    case 0x00: // L8
+    case 0x0B: // P8
+    case 0x0F: // DXT5
+    case 0x0C: // DXT1
+    case 0x0E: // DXT3
+        return true;
+    default:
+        return false;
+    }
+}
+
 // ============================================================================
 // Simple contiguous-memory bump allocator for guest GPU resources
 // ============================================================================
-// ContigAlloc region starts at 0x19000000, above the o1heap (0x200000..0x19000000),
-// to prevent the GPU resource bump allocator from corrupting heap-managed memory.
-static uint32_t s_contigAllocHead = 0x19000000;
+// ContigAlloc region starts at 0x1C000000, just above the HLE o1heap arena
+// (0x18000000–0x1C000000, 64 MB).  The two allocators must never overlap.
+// Upper bound: stay below STACK_TOP-STACK_SIZE = 0x1FEF0000.
+static uint32_t s_contigAllocHead = 0x1C000000;
 
 static uint32_t ContigAlloc(uint32_t size, uint32_t alignment = 64)
 {
     s_contigAllocHead = (s_contigAllocHead + alignment - 1) & ~(alignment - 1);
+    if (s_contigAllocHead + size > (uint32_t)X86_RAM_SIZE) {
+        fprintf(stderr,
+            "[ContigAlloc] OVERFLOW: head=0x%08X size=0x%X would exceed RAM limit 0x%08X!\n",
+            s_contigAllocHead, size, (uint32_t)X86_RAM_SIZE);
+        return 0;
+    }
     uint32_t addr = s_contigAllocHead;
     s_contigAllocHead += size;
     return addr;
@@ -906,7 +1044,7 @@ static uint32_t g_stencilOpZPass    = 0x1E00;     // KEEP
 
 // RW render state lookup table address (maps RW state index -> NV2A method)
 static constexpr uint32_t kRWStateMethodTable = 0x3A8190;
-static constexpr uint32_t kRWStateMethodCount = 92;
+static constexpr uint32_t kRWStateMethodCount = 166;
 
 // Xbox D3D Texture Stage State types (indices 12+ for combiner ops)
 static constexpr uint32_t D3DTSS_COLOROP   = 12;
@@ -1030,9 +1168,23 @@ void Direct3D_CreateDevice(X86Context& ctx, uint8_t* base)
             X86_MEM_WRITE_u32(base, surfAddr + 4, pixBuf);
             X86_MEM_WRITE_u32(base, surfAddr + 8, 0);
             X86_MEM_WRITE_u32(base, kDeviceAddr + kDeviceBackBufBase + i * 4, surfAddr);
+            // Mirror back-buffer surface pointers to cdev+0x1A14+i*4 so that
+            // native code reading *(D3D_pDevice+0x1A14) (where D3D_pDevice=0)
+            // finds a valid surface (used by sub_402C0 to obtain the RT).
+            {
+                uint32_t cdev = X86_MEM_READ_u32(base, 0x35FB48u);
+                X86_MEM_WRITE_u32(base, cdev + 0x1A14 + i * 4, surfAddr);
+            }
             // The first back-buffer is also the initial render target.
-            if (i == 0)
+            // Write to both the HLE tracking field and the Xbox SDK's own field
+            // (D3D_pDevice+0x1A04) so native code that reads the latter sees a
+            // valid surface address from the very first frame.
+            if (i == 0) {
+                uint32_t cdev = X86_MEM_READ_u32(base, 0x35FB48u);
+                X86_MEM_WRITE_u32(base, cdev + 0x1A04, surfAddr);
+                X86_MEM_WRITE_u32(base, kDeviceAddr + 0x1A04, surfAddr);
                 X86_MEM_WRITE_u32(base, kDeviceAddr + kDeviceRenderTarget, surfAddr);
+            }
         }
 
         uint32_t enableDS = X86_MEM_READ_u32(base, pPresent + 0x20);
@@ -1132,8 +1284,14 @@ void D3DDevice_Swap(X86Context& ctx, uint8_t* base)
         }();
         // Blit our scene render target into the DXGI swap-chain buffer.
         // (Scene tex is RT+SR, DXGI buffer is RT-only — formats match.)
-        if (g_d3d11.swapChainTex && g_d3d11.backBufferTex)
+        if (g_d3d11.swapChainTex && g_d3d11.backBufferTex) {
+            // Preserve the completed frame for the next frame's Bloom/Blur
+            if (g_d3d11.prevSceneTex) {
+                g_d3d11.context->CopyResource(g_d3d11.prevSceneTex, g_d3d11.backBufferTex);
+            }
+            // Blit our scene render target into the DXGI swap-chain buffer.
             g_d3d11.context->CopyResource(g_d3d11.swapChainTex, g_d3d11.backBufferTex);
+        }
         g_d3d11.swapChain->Present(s_syncInterval, 0);
         SC_FrameStats();
         // Present() does not actually clear pipeline state on D3D11, but the
@@ -1361,55 +1519,6 @@ void D3DDevice_SetTransform(X86Context& ctx, uint8_t* base)
                 memcpy(g_lastGoodProj, m, 64);
                 g_haveProj = true;
             }
-        }
-    }
-
-    // DIAGNOSTIC: log every *unique* (state, matrix-hash) combination we see,
-    // plus a small running count of repeat calls per state. Previously capped
-    // at 16 absolute so we only ever saw the very first frame of setup.
-    if (pMatrix != 0) {
-        float m[16];
-        memcpy(m, base + pMatrix, 64);
-        // Cheap 64-bit hash of the 16 floats (FNV-1a-ish).
-        uint64_t h = 1469598103934665603ull;
-        const uint32_t* p = reinterpret_cast<const uint32_t*>(m);
-        for (int i = 0; i < 16; i++) { h ^= p[i]; h *= 1099511628211ull; }
-
-        struct Seen { uint32_t state; uint64_t hash; uint32_t count; };
-        static std::vector<Seen> s_seen;
-        static uint32_t s_totalCalls = 0;
-        s_totalCalls++;
-
-        bool novel = true;
-        for (auto& s : s_seen) {
-            if (s.state == state && s.hash == h) { s.count++; novel = false; break; }
-        }
-        if (novel && s_seen.size() < 64) {
-            s_seen.push_back({state, h, 1});
-            if (g_dbg.setXform) {
-                fprintf(stderr, "[SETX] state=%u (#%u novel, %u total) "
-                    "m=[%.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f / "
-                    "%.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f]\n",
-                    state, (uint32_t)s_seen.size(), s_totalCalls,
-                    m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7],
-                    m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
-            }
-        }
-        // Every 1024 calls, dump a short summary so we can see which states
-        // are hot (likely per-object WORLD etc.).
-        if (g_dbg.setXform && (s_totalCalls & 1023) == 0) {
-            fprintf(stderr, "[SETX] summary @ %u calls:", s_totalCalls);
-            uint32_t perState[40] = {};
-            for (auto& s : s_seen) {
-                uint32_t idx = (s.state < 32) ? s.state
-                             : (s.state >= 256 && s.state < 260) ? (32 + s.state - 256)
-                             : 39;
-                if (idx < 40) perState[idx] += s.count;
-            }
-            for (uint32_t i = 0; i < 40; i++) {
-                if (perState[i]) fprintf(stderr, " s%u=%u", i, perState[i]);
-            }
-            fprintf(stderr, " distinct=%u\n", (unsigned)s_seen.size());
         }
     }
 
@@ -1756,36 +1865,32 @@ void D3DDevice_SetRenderTarget(X86Context& ctx, uint8_t* base)
 {
     uint32_t pRT = GuestArg32(ctx, base, 0);
     uint32_t pDS = GuestArg32(ctx, base, 1);
-    {
-        static int s_rtLog = 0;
-        if (s_rtLog < 32) {
-            fprintf(stderr, "[HLE] D3DDevice_SetRenderTarget(pRT=0x%08X, pDS=0x%08X)\n", pRT, pDS);
-            ++s_rtLog;
-        }
-    }
-    if (PpDebug()) {
-        bool isGuestRT = false;
-        uint32_t parent = 0, dataAddr = 0;
-        if (pRT != 0) {
-            auto it = g_d3d11.guestRTBySurface.find(pRT);
-            isGuestRT = (it != g_d3d11.guestRTBySurface.end());
-            parent   = X86_MEM_READ_u32(base, pRT + 0x14);
-            dataAddr = X86_MEM_READ_u32(base, pRT + 4);
-        }
-        fprintf(stderr,
-                "[PP] f=%u SetRT 0x%08X -> 0x%08X parent=0x%08X data=0x%08X (prev draws=%u, isGuest=%d)\n",
-                g_ppFrame, g_ppPrevRT, pRT, parent, dataAddr,
-                g_ppDrawsSinceRT, isGuestRT ? 1 : 0);
-        g_ppPrevRT       = pRT;
-        g_ppDrawsSinceRT = 0;
-    }
 
-    if (pRT != 0)
-        X86_MEM_WRITE_u32(base, kDeviceAddr + kDeviceRenderTarget, pRT);
-    if (pDS != 0)
-        X86_MEM_WRITE_u32(base, kDeviceAddr + kDeviceDepthStencil, pDS);
+    // Write to the Xbox SDK's own current-RT field so native game code that
+    // reads it (sub_3C810, sub_32810) sees the correct value.
+    // D3D_pDevice lives at guest 0x35FB48; we deliberately keep it 0 to avoid
+    // activating ~20 engine code paths, so those functions read from
+    // (cdev=0)+0x1A04 = guest address 0x1A04.  Write there AND to our own
+    // HLE device block at kDeviceAddr+0x1A04.
+    {
+        uint32_t cdev = X86_MEM_READ_u32(base, 0x35FB48u);
+        X86_MEM_WRITE_u32(base, cdev + 0x1A04, pRT);
+        X86_MEM_WRITE_u32(base, cdev + 0x1A08, pDS);
+    }
+    X86_MEM_WRITE_u32(base, kDeviceAddr + 0x1A04, pRT);
+    X86_MEM_WRITE_u32(base, kDeviceAddr + kDeviceRenderTarget, pRT);
+    X86_MEM_WRITE_u32(base, kDeviceAddr + kDeviceDepthStencil, pDS);
 
     g_d3d11.currentRTSurf = pRT;
+
+    if (PpDebug()) {
+        uint32_t pParent = pRT ? X86_MEM_READ_u32(base, pRT + 0x14) : 0;
+        bool inMap = g_d3d11.guestRTBySurface.count(pRT) != 0;
+        fprintf(stderr, "[PP] f=%u SetRT rt=0x%08X ds=0x%08X parent=0x%08X inMap=%d (prev=0x%08X had %u draws)\n",
+                g_ppFrame, pRT, pDS, pParent, (int)inMap, g_ppPrevRT, g_ppDrawsSinceRT);
+        g_ppPrevRT = pRT;
+        g_ppDrawsSinceRT = 0;
+    }
 
     GuestStackCleanup(ctx, 8);
 }
@@ -1831,11 +1936,11 @@ void D3DDevice_SetViewport(X86Context& ctx, uint8_t* base)
     uint32_t pVP = GuestArg32(ctx, base, 0);
     if (pVP != 0) {
         memcpy(base + kDeviceAddr + kDeviceViewport, base + pVP, 24);
-        uint32_t vpX = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 0);
-        uint32_t vpY = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 4);
-        uint32_t vpW = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 8);
-        uint32_t vpH = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 12);
-        //fprintf(stderr, "[HLE] SetViewport(x=%u, y=%u, w=%u, h=%u)\n", vpX, vpY, vpW, vpH);
+        //fprintf(stderr, "[HLE] SetViewport(x=%u, y=%u, w=%u, h=%u)\n",
+        //    X86_MEM_READ_u32(base,kDeviceAddr+kDeviceViewport+0),
+        //    X86_MEM_READ_u32(base,kDeviceAddr+kDeviceViewport+4),
+        //    X86_MEM_READ_u32(base,kDeviceAddr+kDeviceViewport+8),
+        //    X86_MEM_READ_u32(base,kDeviceAddr+kDeviceViewport+12));
     }
     GuestStackCleanup(ctx, 4);
 }
@@ -1893,17 +1998,12 @@ static NV2ATextureState g_nv2aTexture[4];
 
 // D3DDevice_SetTexture  (0x96FD0) — 2 args, ret 8
 extern uint32_t g_currentPSHandle; // defined later in file
+extern uint32_t g_texBoundSource[4];
 static void HLE_SetTexture(uint8_t* base, uint32_t stage, uint32_t pTexture)
 {
     if (stage < 4) {
         X86_MEM_WRITE_u32(base, kDeviceAddr + 0x0B00 + stage * 4, pTexture);
-        g_nv2aTexture[stage].dirty = false; // CPU took explicit control
-    }
-    static int s_logLeft = 16;
-    if (s_logLeft > 0) {
-        fprintf(stderr, "[HLE] SetTexture stage=%u pTexture=0x%08X\n",
-                stage, pTexture);
-        s_logLeft--;
+        g_texBoundSource[stage] = 0; // SRC_HLE
     }
     if (PpDebug() && pTexture != 0) {
         uint32_t dataAddr = X86_MEM_READ_u32(base, pTexture + 4);
@@ -2032,32 +2132,59 @@ void D3DTexture_GetSurfaceLevel2(X86Context& ctx, uint8_t* base)
     uint32_t pThis = GuestArg32(ctx, base, 0);
     uint32_t level = GuestArg32(ctx, base, 1);
 
-    uint32_t surfAddr = ContigAlloc(16, 64);
-    X86_MEM_WRITE_u32(base, surfAddr + 0,
+    // Allocate 24 bytes for a full X_D3DSurface struct
+    uint32_t surfAddr = ContigAlloc(24, 64);
+    X86_MEM_WRITE_u32(base, surfAddr + 0x00,
                       1 | X_D3DCOMMON_TYPE_SURFACE | X_D3DCOMMON_D3DCREATED);
+    
     uint32_t parentData = 0;
-    if (pThis != 0)
-        parentData = X86_MEM_READ_u32(base, pThis + 4);
-    X86_MEM_WRITE_u32(base, surfAddr + 4, parentData);
-    X86_MEM_WRITE_u32(base, surfAddr + 8, 0);
-    X86_MEM_WRITE_u32(base, surfAddr + 12, pThis);
+    uint32_t fmtField = 0;
+    uint32_t sizeField = 0;
+
+    if (pThis != 0) {
+        parentData = X86_MEM_READ_u32(base, pThis + 0x04);
+        fmtField   = X86_MEM_READ_u32(base, pThis + 0x0C);
+        sizeField  = X86_MEM_READ_u32(base, pThis + 0x10);
+        
+        // Advance data pointer based on requested mip level
+        uint8_t xFmt = (fmtField >> X_D3DFORMAT_FORMAT_SHIFT) & 0xFF;
+        uint8_t fmtInfo = XboxFormatInfo(xFmt);
+        uint32_t bppField = fmtInfo & 0x3C;
+        bool isDXT = IsCompressedFormat(xFmt);
+        uint32_t compMin = isDXT ? 2 : 0;
+        
+        uint32_t logU = (fmtField >> X_D3DFORMAT_USIZE_SHIFT) & 0xF;
+        uint32_t logV = (fmtField >> X_D3DFORMAT_VSIZE_SHIFT) & 0xF;
+        uint32_t logP = (fmtField >> X_D3DFORMAT_PSIZE_SHIFT) & 0xF;
+
+        uint32_t offset = 0;
+        uint32_t tU = logU, tV = logV, tP = logP;
+        for (uint32_t i = 0; i < level; ++i) {
+            uint32_t curU = (tU > compMin) ? tU : compMin;
+            uint32_t curV = (tV > compMin) ? tV : compMin;
+            uint32_t levelBits = curU + curV + tP;
+            offset += (1u << levelBits) * bppField / 8;
+            if (tU > 0) tU--;
+            if (tV > 0) tV--;
+            if (tP > 0) tP--;
+        }
+        offset = (offset + 127) & ~127u; // Xbox mip sizes are rounded
+        parentData += offset;
+    }
+
+    X86_MEM_WRITE_u32(base, surfAddr + 0x04, parentData);
+    X86_MEM_WRITE_u32(base, surfAddr + 0x08, 0);         // Lock
+    X86_MEM_WRITE_u32(base, surfAddr + 0x0C, fmtField);  // Format
+    X86_MEM_WRITE_u32(base, surfAddr + 0x10, sizeField); // Size
+    X86_MEM_WRITE_u32(base, surfAddr + 0x14, pThis);     // Parent (Fixed offset!)
 
     if (pThis != 0) {
         uint32_t common = X86_MEM_READ_u32(base, pThis + 0);
         common++;
         X86_MEM_WRITE_u32(base, pThis + 0, common);
-    }
 
-    // Track this surface so SetRenderTarget(surfAddr) can route draws into
-    // the parent's GuestRT. Mirrors the registration done in
-    // D3D_CreateSurfaceOfTexture; without this, post-FX intermediate RTs
-    // produced via texture->GetSurfaceLevel(...) silently fall back to the
-    // back buffer (breaking bloom / motion-blur / reflections / lens flare).
-    if (pThis != 0) {
-        uint32_t pFmt = X86_MEM_READ_u32(base, pThis + 12);
-        uint8_t  xF   = (pFmt >> X_D3DFORMAT_FORMAT_SHIFT) & 0xFF;
-        if (xF == X_D3DFMT_A8R8G8B8 || xF == X_D3DFMT_LIN_A8R8G8B8 ||
-            xF == X_D3DFMT_X8R8G8B8 || xF == X_D3DFMT_LIN_X8R8G8B8) {
+        uint8_t xF = (fmtField >> X_D3DFORMAT_FORMAT_SHIFT) & 0xFF;
+        if (IsRTFormat(xF)) {
             SurfaceRTBind b;
             b.rt     = nullptr;
             b.mip    = level;
@@ -2100,6 +2227,43 @@ void D3DTexture_LockRect(X86Context& ctx, uint8_t* base)
 // Clear / Scissor / Screen offset
 // ============================================================================
 
+static uint32_t GetMipFromSurface(uint8_t* base, uint32_t surfAddr, GuestRT* rt) {
+    if (!rt || !base || surfAddr == 0) return 0;
+    
+    uint32_t sData = X86_MEM_READ_u32(base, surfAddr + 4) & 0x0FFFFFFF;
+    
+    // 1. Look up exact mip offset via the masked data address
+    auto it = g_d3d11.guestRTByDataAddr.find(sData);
+    if (it != g_d3d11.guestRTByDataAddr.end() && it->second.rt == rt) {
+        return it->second.mip;
+    }
+    
+    // 2. Fallback: Compare width to base parent dimensions
+    uint32_t sFmt = X86_MEM_READ_u32(base, surfAddr + 12);
+    uint32_t sSize = X86_MEM_READ_u32(base, surfAddr + 16);
+    
+    uint32_t w = 0;
+    if (sSize != 0) {
+        w = (sSize & X_D3DSIZE_WIDTH_MASK) + 1;
+    } else {
+        uint32_t logU = (sFmt >> X_D3DFORMAT_USIZE_SHIFT) & 0xF;
+        w = 1u << logU;
+    }
+    
+    if (w > 0 && rt->baseW > 0) {
+        uint32_t m = 0;
+        uint32_t mw = rt->baseW;
+        while (mw > w && m < rt->mipCount - 1) {
+            mw = std::max<uint32_t>(1, mw >> 1);
+            m++;
+        }
+        if (mw == w) return m;
+    }
+    return 0;
+}
+
+extern uint8_t* g_b2dBase;
+
 // D3DDevice_Clear  (0x97980) — 6 args, ret 24
 //
 // Args (stdcall):
@@ -2131,9 +2295,12 @@ void D3DDevice_Clear(X86Context& ctx, uint8_t* base)
             if (surfAddr == 0)
                 surfAddr = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceRenderTarget);
             if (surfAddr != 0) {
+                GuestRT* rt = nullptr;
+                uint32_t mip = 0;
+
                 auto it = g_d3d11.guestRTBySurface.find(surfAddr);
                 if (it != g_d3d11.guestRTBySurface.end()) {
-                    GuestRT* rt = it->second.rt;
+                    rt = it->second.rt;
                     if (!rt) {
                         uint32_t pParent = X86_MEM_READ_u32(base, surfAddr + 0x14);
                         if (pParent != 0) {
@@ -2141,15 +2308,33 @@ void D3DDevice_Clear(X86Context& ctx, uint8_t* base)
                             if (rt) it->second.rt = rt;
                         }
                     }
-                    uint32_t mip = it->second.mip;
-                    if (rt && mip < rt->rtvPerMip.size() && rt->rtvPerMip[mip]) {
-                        activeRTV = rt->rtvPerMip[mip];
-                        activeDSV = nullptr; // no depth for off-screen RT
-                        isGuestRT = true;
+                    if (rt) {
+                        mip = GetMipFromSurface(base, surfAddr, rt);
+                        it->second.mip = mip;
                     }
+                } else {
+                    uint32_t pParent = X86_MEM_READ_u32(base, surfAddr + 0x14);
+                    if (pParent != 0) {
+                        rt = EnsureGuestRT(base, pParent);
+                        if (rt) {
+                            mip = GetMipFromSurface(base, surfAddr, rt);
+                            SurfaceRTBind b;
+                            b.rt = rt;
+                            b.mip = mip;
+                            b.parent = pParent;
+                            g_d3d11.guestRTBySurface[surfAddr] = b;
+                        }
+                    }
+                }
+
+                if (rt && mip < rt->rtvPerMip.size() && rt->rtvPerMip[mip]) {
+                    activeRTV = rt->rtvPerMip[mip];
+                    activeDSV = (mip < rt->dsvPerMip.size()) ? rt->dsvPerMip[mip] : nullptr;
+                    isGuestRT = true;
                 }
             }
         }
+
         // ---- D3D11 hardware clear ----
         if (flags & X_D3DCLEAR_TARGET) {
             // Convert A8R8G8B8 to float[4] RGBA
@@ -2157,10 +2342,17 @@ void D3DDevice_Clear(X86Context& ctx, uint8_t* base)
             float r = ((color >> 16) & 0xFF) / 255.0f;
             float g = ((color >>  8) & 0xFF) / 255.0f;
             float b = ((color >>  0) & 0xFF) / 255.0f;
+            // Force alpha=1 on the main backbuffer so post-FX composites that
+            // use SRC_ALPHA blending (blur, reflection) always write correctly.
+            // On real Xbox NV2A hardware the framebuffer alpha is 1 after 3D
+            // rendering; the game's motion-blur composite PS multiplies its
+            // output alpha by backbuffer.a — so zero here makes it invisible.
+            if (!isGuestRT) a = 1.0f;
             float clearColor[4] = { r, g, b, a };
             g_d3d11.context->ClearRenderTargetView(activeRTV, clearColor);
         }
-        if (!isGuestRT && (flags & (X_D3DCLEAR_ZBUFFER | X_D3DCLEAR_STENCIL)) && activeDSV) {
+
+        if ((flags & (X_D3DCLEAR_ZBUFFER | X_D3DCLEAR_STENCIL)) && activeDSV) {
             UINT dsFlags = 0;
             if (flags & X_D3DCLEAR_ZBUFFER) dsFlags |= D3D11_CLEAR_DEPTH;
             if (flags & X_D3DCLEAR_STENCIL) dsFlags |= D3D11_CLEAR_STENCIL;
@@ -2289,6 +2481,15 @@ extern float    g_pshConstants[16][4];
 extern uint32_t g_pshConstantsDirty;
 extern uint32_t g_psFinalCombinerConst[2];
 static void ProcessNV2AMethod(uint32_t method, uint32_t value) {
+    // Legitimate render-state calls are well-formed push-buffer header words:
+    //   bits[31:18] = count == 1, bit[17] = 0 (incrementing), bits[15:13] = 0
+    //   (subchannel 0) → the 0x0004xxxx family.
+    // Anything outside that family (ASCII-text profiler labels, zero-count
+    // NOPs, etc.) comes from debug/profiler init code that reuses the
+    // SetRenderState_Simple path to write scratch data.  Silently discard.
+    if ((method & 0xFFFC0000) != 0x00040000)
+        return;
+
     bool handled = true;
     switch (method) {
         case NV2A_SET_ALPHA_TEST_ENABLE:       g_alphaTestEnabled  = (value != 0); break;
@@ -2663,6 +2864,19 @@ static uint64_t s_pbWalkStats_consts  = 0;
 static uint32_t g_pbGuestBase = 0;
 static uint32_t g_pbGuestSize = 0;
 
+// Separate ring for recompiled code (sub_3DA90) that writes inline NV2A
+// vertex data via CDevice.m_pPush at guest address 0 (since D3D_pDevice=0).
+// Must NOT share the same base as the HLE ring so that HLE constant uploads
+// and recompiled IM writes don't overwrite each other.
+static uint32_t g_pbIMBase = 0;
+static uint32_t g_pbIMSize = 0x10000; // 64 KB — plenty for one frame of IM writes
+static uint32_t s_pbIMLastWalked = 0;
+
+// Set to true only while WalkPushBuffer is called from D3DDevice_End so that
+// inline vertex collection (SET_BEGIN_END, VERTEX2F_M, etc.) is active only
+// for the IM ring, not for the shader-constant ring walked during 3D draws.
+static bool g_pbWalkForIM = false;
+
 static void EnsurePushBuffer(uint8_t* base) {
     if (g_pbGuestBase) return;
     g_pbGuestSize = 0x00800000; // 8 MiB
@@ -2670,8 +2884,20 @@ static void EnsurePushBuffer(uint8_t* base) {
     X86_MEM_WRITE_u32(base, 0x35D6A0u, g_pbGuestBase);
     X86_MEM_WRITE_u32(base, 0x35D6A4u, g_pbGuestBase + g_pbGuestSize);
     s_pbLastWalked = g_pbGuestBase;
-    fprintf(stderr, "[PB] ring allocated base=0x%08X size=0x%X\n",
+    fprintf(stderr, "[PB] HLE ring allocated base=0x%08X size=0x%X\n",
             g_pbGuestBase, g_pbGuestSize);
+}
+
+static void EnsureIMPushBuffer(uint8_t* base) {
+    if (g_pbIMBase) return;
+    g_pbIMBase = ContigAlloc(g_pbIMSize, 4096);
+    // Write to CDevice.m_pPush/m_pLimit (addresses 0/4 since D3D_pDevice=0)
+    // so recompiled sub_3DA90 uses this dedicated ring.
+    X86_MEM_WRITE_u32(base, 0u, g_pbIMBase);
+    X86_MEM_WRITE_u32(base, 4u, g_pbIMBase + g_pbIMSize);
+    s_pbIMLastWalked = g_pbIMBase;
+    fprintf(stderr, "[PB] IM ring allocated base=0x%08X size=0x%X\n",
+            g_pbIMBase, g_pbIMSize);
 }
 
 static inline void NV2A_UploadConst(uint8_t* base, uint32_t slot, const uint8_t* src) {
@@ -2688,31 +2914,137 @@ static inline void NV2A_UploadConst(uint8_t* base, uint32_t slot, const uint8_t*
     s_pbWalkStats_consts++;
 }
 
+// ---- NV2A texture state shadowed from the push buffer --------------------
+struct NV2ATextureState {
+    uint32_t offset    = 0;   // NV097_SET_TEXTURE_OFFSET  — raw GPU addr
+    uint32_t format    = 0;   // context dma + color + logU/V/P + mips + dim
+    uint32_t address   = 0;   // wrap modes
+    uint32_t control0  = 0;
+    uint32_t control1  = 0;   // pitch (bits 16..31)
+    uint32_t imageRect = 0;   // (width-1 << 16) | (height-1)
+    uint32_t palette   = 0;
+    bool     dirty     = false;
+};
+static NV2ATextureState g_nv2aTexture[4];
+static uint32_t g_texBoundSource[4] = {0}; // 0 = HLE SetTexture, 1 = NV2A Push Buffer
+// NV2A viewport scale/translate (set via push buffer NV097_SET_VIEWPORT_SCALE/TRANSLATE).
+// scale.y is the half-height in clip space, translate.y is the screen-space center Y.
+// Used to reconstruct CB2D screenSize/Offset for post-FX draws that bypass SetViewport.
+static float g_nv2aVpScaleX     = 0.0f;
+static float g_nv2aVpScaleY     = 0.0f;
+static float g_nv2aVpTranslateX = 0.0f;
+static float g_nv2aVpTranslateY = 0.0f;
+
+// NV2A inline vertex state — captured from push-buffer methods 0x18C4/0x18C8
+// (TEXCOORD0_S/T), 0x18D0/0x18D4 (TEXCOORD1_S/T), and 0x1880 (VERTEX2F_M).
 static void WalkPushBuffer(uint8_t* base) {
-    uint32_t pbPut = X86_MEM_READ_u32(base, 0x35D6A0);
-    static int s_probe = 0;
-    if (s_probe < 20) {
-        fprintf(stderr, "[PB] walk: put=0x%08X last=0x%08X\n", pbPut, s_pbLastWalked);
-        s_probe++;
+    // Walk the HLE shader-constant ring (0x35D6A0).
+    uint32_t pbPut = X86_MEM_READ_u32(base, 0x35D6A0u);
+
+    // ---- Safety: pbPut must be within guest RAM and within the HLE ring ----
+    // If it's outside, the ring pointer was corrupted by some code path we
+    // haven't intercepted yet.  Reset it and bail so we don't crash.
+    {
+        bool oob = (pbPut >= (uint32_t)X86_RAM_SIZE);
+        bool outOfRing = g_pbGuestBase != 0 &&
+                         (pbPut < g_pbGuestBase || pbPut > g_pbGuestBase + g_pbGuestSize);
+        if (oob || outOfRing) {
+            static int s_pbOobLog = 0;
+            if (s_pbOobLog++ < 10) {
+                fprintf(stderr,
+                    "[PB] WARN: pbPut=0x%08X outside ring [0x%08X,0x%08X] "
+                    "(RAM=0x%08X) — ring corrupted, resetting.\n",
+                    pbPut, g_pbGuestBase, g_pbGuestBase + g_pbGuestSize,
+                    (uint32_t)X86_RAM_SIZE);
+                x86_print_host_stack("PB-WARN", 2, 32);
+            }
+            uint32_t safe = g_pbGuestBase ? g_pbGuestBase : 0u;
+            X86_MEM_WRITE_u32(base, 0x35D6A0u, safe);
+            s_pbLastWalked = safe;
+            return;
+        }
     }
-    if (s_pbLastWalked == 0) { s_pbLastWalked = pbPut; return; }
+
+    if (s_pbLastWalked == 0) { s_pbLastWalked = pbPut; }
+    if (pbPut <  s_pbLastWalked) { s_pbLastWalked = pbPut; } // wrap
+    // Walk the separate IM ring (addr 0, used by recompiled sub_3DA90).
+    // Only do this when called from D3DDevice_End (g_pbWalkForIM=true).
+    if (g_pbWalkForIM && g_pbIMBase) {
+        uint32_t imPut = X86_MEM_READ_u32(base, 0u);
+        if (s_pbIMLastWalked == 0) s_pbIMLastWalked = imPut;
+        if (imPut != s_pbIMLastWalked && imPut >= s_pbIMLastWalked) {
+            bool imInlineActive = false; // tracks BEGIN/END inside this walk
+            static int s_probe = 0;
+            if (s_probe < 20) {
+                fprintf(stderr, "[PB] IM walk: put=0x%08X last=0x%08X range=%u\n",
+                        imPut, s_pbIMLastWalked, imPut - s_pbIMLastWalked);
+                s_probe++;
+            }
+            // Walk IM ring inline vertex data
+            uint32_t ip = s_pbIMLastWalked;
+            while (ip + 4 <= imPut) {
+                uint32_t hdr = X86_MEM_READ_u32(base, ip);
+                ip += 4;
+                uint32_t count  = (hdr >> 18) & 0x7FF;
+                uint32_t method = (hdr & 0x1FFC);
+                if (count == 0 || ip + count * 4 > imPut) break;
+                switch (method) {
+                case 0x17FC: { // SET_BEGIN_END
+                    uint32_t prim = X86_MEM_READ_u32(base, ip);
+                    if (prim == 0) {
+                        imInlineActive = false;
+                    } else {
+                        imInlineActive = true;
+                        if (!g_imActive) {
+                            g_imActive = true;
+                            g_imPrimType = (int)prim;
+                            g_imCurrent = {};
+                            g_imCurrent.diffuse = 0xFFFFFFFF;
+                            g_imCurrent.w = 1.0f;
+                        }
+                    }
+                    break;
+                }
+                case 0x18C4: // TEXCOORD0_2F_S — U
+                    if (count >= 1) {
+                        uint32_t b = X86_MEM_READ_u32(base, ip);
+                        memcpy(&g_imCurrent.u, &b, 4);
+                        if (count >= 2) { b = X86_MEM_READ_u32(base, ip+4); memcpy(&g_imCurrent.v, &b, 4); }
+                    }
+                    break;
+                case 0x18C8: // TEXCOORD0_2F_T — data[0]=horiz(U), data[1]=vert(V)
+                    if (count >= 1) {
+                        uint32_t b = X86_MEM_READ_u32(base, ip);
+                        memcpy(&g_imCurrent.u, &b, 4);
+                        if (count >= 2) { b = X86_MEM_READ_u32(base, ip+4); memcpy(&g_imCurrent.v, &b, 4); }
+                    }
+                    break;
+                case 0x1880: // VERTEX2F_M — X,Y: emit vertex
+                    if (count >= 2 && imInlineActive) {
+                        uint32_t xb = X86_MEM_READ_u32(base, ip);
+                        uint32_t yb = X86_MEM_READ_u32(base, ip+4);
+                        memcpy(&g_imCurrent.x, &xb, 4);
+                        memcpy(&g_imCurrent.y, &yb, 4);
+                        g_imVertices.push_back(g_imCurrent);
+                    }
+                    break;
+                default: break;
+                }
+                ip += count * 4;
+            }
+            s_pbIMLastWalked = imPut;
+        }
+    }
+    // Now continue with the HLE ring walk below.
     if (pbPut == s_pbLastWalked) return;
-    if (pbPut <  s_pbLastWalked) { s_pbLastWalked = pbPut; return; } // wrap
 
     uint32_t p = s_pbLastWalked;
     uint32_t end = pbPut;
     uint32_t curConstAddr = 0;
 
-    static int s_hdrProbe = 0;
     while (p + 4 <= end) {
         uint32_t hdr = X86_MEM_READ_u32(base, p);
-        if (s_hdrProbe < 30) {
-            fprintf(stderr, "[PB]   @0x%08X hdr=0x%08X method=0x%04X count=%u instr=%u\n",
-                    p, hdr, (hdr & 0x1FFC), (hdr >> 18) & 0x7FF, (hdr >> 29) & 7);
-            s_hdrProbe++;
-        }
-        p += 4;
-
+        p += 4; // advance past header; all data reads below use p for first payload DWORD
         uint32_t instr  = (hdr >> 29) & 0x7;
         uint32_t count  = (hdr >> 18) & 0x7FF;
         // uint32_t sub = (hdr >> 13) & 0x7;
@@ -2722,7 +3054,7 @@ static void WalkPushBuffer(uint8_t* base) {
         if (instr == 1 /*JMP_NEAR*/ || instr == 2 /*CALL_FAR*/) continue;
 
         if (count == 0) continue;
-        if (p + count * 4 > end) break;
+        if (p + count * 4 > end + 4) break; // +4: p already past header
 
         s_pbWalkStats_methods++;
 
@@ -2733,10 +3065,26 @@ static void WalkPushBuffer(uint8_t* base) {
         case 0x0B80: // NV2A_VP_UPLOAD_CONST(0) — N*4 DWORDs of float4s,
                      // auto-incrementing curConstAddr.
             for (uint32_t i = 0; i + 4 <= count; i += 4) {
+                // Belt-and-suspenders: payload + 16 bytes must be in guest RAM.
+                if ((uint64_t)p + i * 4 + 16 > (uint64_t)X86_RAM_SIZE) break;
                 NV2A_UploadConst(base, curConstAddr,
                                  base + p + i * 4);
                 curConstAddr++;
             }
+            break;
+        case 0x09CC: // NV097_SET_VIEWPORT_SCALE_X
+            if (count >= 1) g_nv2aVpScaleX = std::bit_cast<float>(X86_MEM_READ_u32(base, p));
+            if (count >= 2) g_nv2aVpScaleY = std::bit_cast<float>(X86_MEM_READ_u32(base, p + 4));
+            break;
+        case 0x09D0: // NV097_SET_VIEWPORT_SCALE_Y
+            if (count >= 1) g_nv2aVpScaleY = std::bit_cast<float>(X86_MEM_READ_u32(base, p));
+            break;
+        case 0x0AF0: // NV097_SET_VIEWPORT_TRANSLATE_X
+            if (count >= 1) g_nv2aVpTranslateX = std::bit_cast<float>(X86_MEM_READ_u32(base, p));
+            if (count >= 2) g_nv2aVpTranslateY = std::bit_cast<float>(X86_MEM_READ_u32(base, p + 4));
+            break;
+        case 0x0AF4: // NV097_SET_VIEWPORT_TRANSLATE_Y
+            if (count >= 1) g_nv2aVpTranslateY = std::bit_cast<float>(X86_MEM_READ_u32(base, p));
             break;
         default: {
             // NV097_SET_COMBINER_FACTOR0/1 (0x1A60..0x1A9C): 16 D3DCOLOR
@@ -2789,7 +3137,11 @@ static void WalkPushBuffer(uint8_t* base) {
                         uint32_t val = X86_MEM_READ_u32(base, p + i * 4);
                         uint32_t s   = sub + i * 4;
                         switch (s) {
-                        case 0x00: g_nv2aTexture[stage].offset    = val; g_nv2aTexture[stage].dirty = true; break;
+                        case 0x00: 
+                            g_nv2aTexture[stage].offset = val; 
+                            g_nv2aTexture[stage].dirty = true; 
+                            g_texBoundSource[stage] = 1; // SRC_NV2A
+                            break;
                         case 0x04: {
                             g_nv2aTexture[stage].format = val;
                             g_nv2aTexture[stage].dirty = true;
@@ -3432,40 +3784,7 @@ void D3DDevice_DrawVertices(X86Context& ctx, uint8_t* base)
     std::vector<SWVertex> verts(vertCount);
     for (uint32_t i = 0; i < vertCount; i++)
         verts[i] = ParseFVFVertex(vertBase + i * stride, fvf);
-
-    if (shouldLog && vertCount >= 3) {
-        //for (uint32_t i = 0; i < std::min(vertCount, 4u); i++) {
-        //    fprintf(stderr, "  v[%u] pos=(%.1f, %.1f, %.1f, %.1f) diffuse=%08X uv=(%.3f, %.3f)\n",
-        //            i, verts[i].x, verts[i].y, verts[i].z, verts[i].w,
-        //            verts[i].diffuse, verts[i].u, verts[i].v);
-        //}
-        //RenderTarget rt;
-        //if (GetRT(base, rt))
-        //    fprintf(stderr, "  RT: %ux%u pixels=%p\n", rt.w, rt.h, rt.pixels);
-        //else
-        //    fprintf(stderr, "  RT: FAILED to get render target!\n");
-    }
-
-    // Log vertex data for quad draws (logo rendering debug)
-    if (primType == 8 && vertCount == 4) {
-        //static int s_quadVertLog = 0;
-        //if (s_quadVertLog < 40) {
-        //    for (uint32_t i = 0; i < vertCount; i++) {
-        //        fprintf(stderr, "  v[%u] pos=(%.1f, %.1f, %.1f, %.1f) diffuse=%08X uv=(%.3f, %.3f)\n",
-        //                i, verts[i].x, verts[i].y, verts[i].z, verts[i].w,
-        //                verts[i].diffuse, verts[i].u, verts[i].v);
-        //    }
-        //    uint32_t texStage0 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
-        //    fprintf(stderr, "  texture[0]=0x%08X\n", texStage0);
-        //    RenderTarget rt;
-        //    if (GetRT(base, rt))
-        //        fprintf(stderr, "  RT: %ux%u\n", rt.w, rt.h);
-        //    else
-        //        fprintf(stderr, "  RT: FAILED\n");
-        //    s_quadVertLog++;
-        //}
-    }
-
+    
     SubmitPrims(base, verts.data(), verts.size(), (int)primType);
     g_drawCallCount++;
 
@@ -3482,13 +3801,27 @@ void D3DDevice_SetVertexData2f(X86Context& ctx, uint8_t* base)
     memcpy(&fx, &xBits, 4);
     memcpy(&fy, &yBits, 4);
 
-    if (reg == X_D3DVSDE_TEXCOORD0 || reg == X_D3DVSDE_TEXCOORD1) {
+    if (reg == X_D3DVSDE_TEXCOORD0) {
+        // Only track texcoord0 (reg 9).  sub_3DA90 also calls
+        // SetVertexData2f(10, ...) for texcoord1, which must NOT overwrite
+        // the texcoord0 U/V we just captured.
         g_imCurrent.u = fx;
         g_imCurrent.v = fy;
     } else if (reg == X_D3DVSDE_POSITION || reg == (int)X_D3DVSDE_VERTEX) {
+        // sub_3DA90's v3=true path interleaves inline NV2A texcoord writes to
+        // the push buffer with SetVertexData2f(POSITION) calls.  Walk the IM
+        // ring right now so those texcoords update g_imCurrent before we push.
+        if (g_pbIMBase) {
+            g_pbWalkForIM = true;
+            WalkPushBuffer(base);
+            g_pbWalkForIM = false;
+        }
+        if (!g_imActive) {
+            g_imActive   = true;
+            g_imPrimType = NV2A_PRIM_QUADS;
+        }
         g_imCurrent.x = fx;
         g_imCurrent.y = fy;
-        // Position write triggers vertex emission
         g_imVertices.push_back(g_imCurrent);
     }
 
@@ -3515,7 +3848,8 @@ void D3DDevice_SetVertexData4f(X86Context& ctx, uint8_t* base)
         g_imCurrent.z = fz;
         g_imCurrent.w = fw;
         g_imVertices.push_back(g_imCurrent);
-    } else if (reg == (uint32_t)X_D3DVSDE_TEXCOORD0 || reg == (uint32_t)X_D3DVSDE_TEXCOORD1) {
+    } else if (reg == (uint32_t)X_D3DVSDE_TEXCOORD0) {
+        // Only texcoord0; TEXCOORD1 must not overwrite the captured U/V.
         g_imCurrent.u = fx;
         g_imCurrent.v = fy;
     } else if (reg == X_D3DVSDE_DIFFUSE) {
@@ -3559,19 +3893,30 @@ void D3DDevice_Begin(X86Context& ctx, uint8_t* base)
 // D3DDevice_End  (0x99720) — 0 args, plain ret
 void D3DDevice_End(X86Context& ctx, uint8_t* base)
 {
-    if (g_imActive && !g_imVertices.empty()) {
-        uint32_t texAddr = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
-        //static int s_endLog = 0;
-        //if (s_endLog < 200) {
-        //    fprintf(stderr, "[HLE] End: %zu verts, prim=%d, tex=0x%08X",
-        //            g_imVertices.size(), g_imPrimType, texAddr);
-        //    if (!g_imVertices.empty()) {
-        //        auto& v0 = g_imVertices[0];
-        //        fprintf(stderr, " v0=(%.1f,%.1f)", v0.x, v0.y);
-        //    }
-        //    fprintf(stderr, "\n");
-        //    s_endLog++;
-        //}
+    // Walk the IM ring (sub_3DA90's inline NV2A vertex writes).
+    // g_pbWalkForIM gates vertex capture so the HLE ring walker (called
+    // during 3D draws) never accidentally activates IM mode.
+    EnsureIMPushBuffer(base);
+    g_pbWalkForIM = true;
+    WalkPushBuffer(base);
+    g_pbWalkForIM = false;
+
+    if (!g_imVertices.empty()) {
+        static int s_endLog = 0;
+        if (s_endLog < 200) {
+            uint32_t texAddr = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
+            uint32_t rtSurf  = g_d3d11.currentRTSurf;
+            uint32_t nv0off  = g_nv2aTexture[0].offset;
+            fprintf(stderr, "[HLE] End f=%u d=%u: %zu verts prim=%d tex=0x%08X src=%d nv0=0x%08X RT=0x%08X",
+                    g_ppFrame, g_drawCallCount, g_imVertices.size(), g_imPrimType,
+                    texAddr, g_texBoundSource[0], nv0off, rtSurf);
+            if (!g_imVertices.empty()) {
+                auto& v0 = g_imVertices[0];
+                fprintf(stderr, " v0=(%.1f,%.1f uv=%.3f,%.3f)", v0.x, v0.y, v0.u, v0.v);
+            }
+            fprintf(stderr, "\n");
+            s_endLog++;
+        }
         SubmitPrims(base, g_imVertices.data(), g_imVertices.size(), g_imPrimType);
         g_drawCallCount++;
     }
@@ -3802,15 +4147,16 @@ void D3DDevice_SetVertexShader(X86Context& ctx, uint8_t* base)
 {
     uint32_t handle = GuestArg32(ctx, base, 0);
     g_currentVSHandle = handle;
-    static uint32_t s_lastHandle = 0xFFFFFFFFu;
-    if (handle != s_lastHandle) {
-        // fprintf(stderr, "[HLE] SetVertexShader handle=0x%08X (bit0=%u)\n",
-        //         handle, handle & 1);
-        s_lastHandle = handle;
+    
+    uint32_t cdev = X86_MEM_READ_u32(base, 0x35FB48u);
+    if (cdev != 0) {
+        cdev &= 0x3FFFFFFFu;
+        X86_MEM_WRITE_u32(base, cdev + 0x798u, handle);
     }
-    // On Xbox, if bit 0 is clear the handle IS the FVF code
-    if (!(handle & 1))
-        g_currentFVF = handle;
+    
+    // Invalidate Burnout 3's custom VS cache so it doesn't skip future binds
+    X86_MEM_WRITE_u32(base, 0x41AAB8, 0xFFFFFFFF);
+
     GuestStackCleanup(ctx, 4);
 }
 
@@ -3980,6 +4326,10 @@ void D3DDevice_SetPixelShader(X86Context& ctx, uint8_t* base)
     uint32_t handle = GuestArg32(ctx, base, 0);
     uint32_t prevHandle = g_currentPSHandle;
     g_currentPSHandle = handle;
+    
+    // Invalidate Burnout 3's custom PS cache
+    X86_MEM_WRITE_u32(base, 0x41AABC, 0xFFFFFFFF);
+
     // Snapshot the four texture handles currently bound. On real Xbox the GPU
     // keeps the last-written texture registers even when D3DDevice_SetTexture
     // is later called with NULL; this snapshot lets BindTranslatedPSFor2D
@@ -3987,6 +4337,32 @@ void D3DDevice_SetPixelShader(X86Context& ctx, uint8_t* base)
     if (handle != 0 && base) {
         for (uint32_t s = 0; s < 4; ++s)
             g_psTexHandleSnapshot[s] = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + s * 4);
+    }
+    if (handle == 0x00900000 || handle == 0x00901000) {
+        static int s_setPS[2] = {};
+        int slot = (handle == 0x00900000) ? 0 : 1;
+        if (s_setPS[slot]++ < 4) {
+            uint32_t hlT0 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
+            uint32_t hlT1 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B04);
+            uint32_t hlT2 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B08);
+            uint32_t hlT3 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B0C);
+            fprintf(stderr,
+                "[PS-SET] PS=0x%08X prev=0x%08X hlT=[0x%08X,0x%08X,0x%08X,0x%08X]\n",
+                handle, prevHandle, hlT0, hlT1, hlT2, hlT3);
+        }
+    }
+    if (handle == 0x00900000) {
+        static int s_set900 = 0;
+        if (s_set900++ < 16) {
+            uint32_t retAddr = X86_MEM_READ_u32(base, ctx.esp);
+            uint32_t hlT0 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
+            uint32_t hlT1 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B04);
+            uint32_t hlT2 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B08);
+            uint32_t hlT3 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B0C);
+            fprintf(stderr,
+                "[PS900-SET] #%d ret=0x%08X prev=0x%08X hlT=[0x%08X,0x%08X,0x%08X,0x%08X]\n",
+                s_set900, retAddr, prevHandle, hlT0, hlT1, hlT2, hlT3);
+        }
     }
     // Lazy translation path: Burnout 3 inlines D3DDevice_CreatePixelShader,
     // so our CreatePixelShader hook never fires. The handle the game passes
@@ -4013,47 +4389,9 @@ void D3DDevice_SetPixelShader(X86Context& ctx, uint8_t* base)
             Nv2aPsHlsl::Result tr = Nv2aPsHlsl::Translate(dwords);
             TranslatedPS entry;
             if (tr.ok) {
-                // DEBUG: when B3_DEBUG_REFL_PS=1, replace the reflection
-                // PSes' HLSL with a trivial shader that returns env-map t1
-                // RGB directly so we can confirm the texture sample is
-                // landing on visible texels.
-                static int s_dbgRefl = -1;
-                if (s_dbgRefl < 0) {
-                    const char* e = std::getenv("B3_DEBUG_REFL_PS");
-                    s_dbgRefl = (e && *e == '1') ? 1 : 0;
-                }
                 const bool isReflPS = (handle == 0x008F9000) ||
                     (handle == 0x008FD000) ||
                     (handle == 0x008FF000);
-                // Broader debug: any 2-stage PS (stage 0 + stage 1 sampled).
-                const bool isDualStage =
-                    tr.samplesStage[0] && tr.samplesStage[1];
-                if (s_dbgRefl && (isReflPS || isDualStage)) {
-                    tr.hlsl =
-                        "Texture2D tex2D0 : register(t0); SamplerState sampler0 : register(s0);\n"
-                        "Texture2D tex2D1 : register(t1); SamplerState sampler1 : register(s1);\n"
-                        "struct PSInput { float4 pos:SV_POSITION; float4 oD0:COLOR0; float4 oD1:COLOR1;\n"
-                        "  float4 oFog:FOG; float4 oT0:TEXCOORD0; float4 oT1:TEXCOORD1;\n"
-                        "  float4 oT2:TEXCOORD2; float4 oT3:TEXCOORD3; };\n"
-                        "float4 main(PSInput i) : SV_Target {\n"
-                        // Sample stage-1 at the *true* UVs and then again
-                        // at fixed (0.25,0.25) and (0.75,0.75). Render as a
-                        // 2x2 quadrant pattern so we can see whether the
-                        // texture has any visible content at all.
-                        "  float4 a = tex2D1.Sample(sampler1, i.oT1.xy);\n"
-                        "  float4 b = tex2D1.Sample(sampler1, float2(0.25,0.25));\n"
-                        "  float4 c = tex2D1.Sample(sampler1, float2(0.75,0.75));\n"
-                        "  float4 d = tex2D1.Sample(sampler1, float2(0.5,0.5));\n"
-                        "  float2 uv = i.pos.xy / float2(640,480);\n"
-                        "  if (uv.x < 0.5 && uv.y < 0.5) return float4(a.rgb, 1);\n"
-                        "  if (uv.x >= 0.5 && uv.y < 0.5) return float4(b.rgb, 1);\n"
-                        "  if (uv.x < 0.5 && uv.y >= 0.5) return float4(c.rgb, 1);\n"
-                        "  return float4(d.rgb, 1);\n"
-                        "}\n";
-                    fprintf(stderr,
-                        "[PSH] DEBUG: replaced reflection PS h=0x%08X with t1 quadrant visualizer\n",
-                        handle);
-                }
                 if (ID3DBlob* blob = D3D11CompileShader(tr.hlsl.c_str(), "main", "ps_5_0")) {
                     HRESULT hr = g_d3d11.device->CreatePixelShader(
                         blob->GetBufferPointer(), blob->GetBufferSize(),
@@ -4071,44 +4409,23 @@ void D3DDevice_SetPixelShader(X86Context& ctx, uint8_t* base)
                 for (int i = 0; i < 8; ++i) entry.bakedC0[i] = tr.bakedC0[i];
                 for (int i = 0; i < 8; ++i) entry.bakedC1[i] = tr.bakedC1[i];
             }
-            static int s_logCount = 0;
-            if (s_logCount < 8) {
-                fprintf(stderr,
-                    "[PSH] SetPixelShader h=0x%08X psDef=0x%08X ok=%d ps=%p "
-                    "stages[0..3]=%d,%d,%d,%d combiners=%u(probe=%u)\n",
-                    handle, psDefAddr, (int)tr.ok, (void*)entry.ps,
-                    (int)tr.samplesStage[0], (int)tr.samplesStage[1],
-                    (int)tr.samplesStage[2], (int)tr.samplesStage[3],
-                    tr.numCombiners, combinerCount);
-                fprintf(stderr,
-                    "[PSH]   bakedC0: %08X %08X %08X %08X %08X %08X %08X %08X\n",
-                    entry.bakedC0[0], entry.bakedC0[1], entry.bakedC0[2], entry.bakedC0[3],
-                    entry.bakedC0[4], entry.bakedC0[5], entry.bakedC0[6], entry.bakedC0[7]);
-                fprintf(stderr,
-                    "[PSH]   bakedC1: %08X %08X %08X %08X %08X %08X %08X %08X\n",
-                    entry.bakedC1[0], entry.bakedC1[1], entry.bakedC1[2], entry.bakedC1[3],
-                    entry.bakedC1[4], entry.bakedC1[5], entry.bakedC1[6], entry.bakedC1[7]);
-                ++s_logCount;
-            }
-            static int s_dumpCount = 0;
-            static int s_dumpAll = -1;
-            if (s_dumpAll < 0) {
-                const char* e = std::getenv("B3_DUMP_PS");
-                s_dumpAll = (e && *e && *e != '0') ? 1 : 0;
-            }
-            if (tr.ok && (s_dumpAll || s_dumpCount < 8)) {
-                char fname[96];
-                if (s_dumpAll)
-                    std::snprintf(fname, sizeof(fname), "ps_dump/PS_%08X.hlsl", handle);
-                else
-                    std::snprintf(fname, sizeof(fname), "pshader_0x%08X.hlsl", handle);
-                if (FILE* fp = std::fopen(fname, "w")) {
-                    std::fwrite(tr.hlsl.data(), 1, tr.hlsl.size(), fp);
-                    std::fclose(fp);
-                }
-                ++s_dumpCount;
-            }
             SeedPSConstantsFromBaked(entry);
+            fprintf(stderr, "[PSH] h=0x%08X psDefOff=%u combiners=%u compiled=%s usesStage=%d%d%d%d HLSL_len=%zu\n",
+                handle, (psDefAddr - handle), tr.numCombiners,
+                entry.ps ? "OK" : "FAIL",
+                (int)entry.usesStage[0], (int)entry.usesStage[1],
+                (int)entry.usesStage[2], (int)entry.usesStage[3],
+                entry.hlsl.size());
+            // Dump HLSL for blur PSes to aid debugging.
+            if (handle == 0x00900000u || handle == 0x00901000u) {
+                char fname[64];
+                snprintf(fname, sizeof(fname), "blur_ps_%08X.hlsl", handle);
+                if (FILE* f = fopen(fname, "w")) {
+                    fwrite(entry.hlsl.c_str(), 1, entry.hlsl.size(), f);
+                    fclose(f);
+                    fprintf(stderr, "[PSH] Dumped HLSL to %s\n", fname);
+                }
+            }
             g_psByHandle.emplace(handle, std::move(entry));
         }
         else {
@@ -4360,11 +4677,21 @@ void D3D_BlockOnTime(X86Context& ctx, uint8_t* base)
 void D3D_MakeRequestedSpace(X86Context& ctx, uint8_t* base)
 {
     EnsurePushBuffer(base);
+    EnsureIMPushBuffer(base);
     WalkPushBuffer(base);
+    // Reset HLE ring
     X86_MEM_WRITE_u32(base, 0x35D6A0u, g_pbGuestBase);
     s_pbLastWalked = g_pbGuestBase;
-    // Return the new put in EAX (callers often use the result as &[put]).
-    ctx.eax = g_pbGuestBase;
+    // Reset IM ring
+    X86_MEM_WRITE_u32(base, 0u, g_pbIMBase);
+    X86_MEM_WRITE_u32(base, 4u, g_pbIMBase + g_pbIMSize);
+    s_pbIMLastWalked = g_pbIMBase;
+    // Return the IM ring base — recompiled code (sub_3DA90/sub_402C0) uses
+    // the return value as its push-buffer write pointer.  Returning
+    // g_pbIMBase keeps all their writes inside the IM ring so that
+    // WalkPushBuffer can find them; the HLE ring is only used by the
+    // HLE shader-constant walker which tracks 0x35D6A0 independently.
+    ctx.eax = g_pbIMBase;
     GuestStackCleanup(ctx, 8);
 }
 
@@ -4372,10 +4699,16 @@ void D3D_MakeRequestedSpace(X86Context& ctx, uint8_t* base)
 void D3DDevice_MakeSpace(X86Context& ctx, uint8_t* base)
 {
     EnsurePushBuffer(base);
+    EnsureIMPushBuffer(base);
     WalkPushBuffer(base);
+    // Reset HLE ring
     X86_MEM_WRITE_u32(base, 0x35D6A0u, g_pbGuestBase);
     s_pbLastWalked = g_pbGuestBase;
-    ctx.eax = g_pbGuestBase;
+    // Reset IM ring
+    X86_MEM_WRITE_u32(base, 0u, g_pbIMBase);
+    X86_MEM_WRITE_u32(base, 4u, g_pbIMBase + g_pbIMSize);
+    s_pbIMLastWalked = g_pbIMBase;
+    ctx.eax = g_pbIMBase; // same reasoning as D3D_MakeRequestedSpace
     GuestStackCleanup(ctx, 0);
 }
 
@@ -5187,17 +5520,28 @@ void D3D_PixelJar_GetSlice(X86Context& ctx, uint8_t* base) {
 
 void D3DDevice_SetRenderTargetFast(X86Context& ctx, uint8_t* base) {
     uint32_t pRT = GuestArg32(ctx, base, 0);
+
+    // Mirror the RT into the Xbox SDK's own field (same fix as SetRenderTarget).
     {
-        static int s_rtLog = 0;
-        if (s_rtLog < 32) {
-            fprintf(stderr, "[HLE] D3DDevice_SetRenderTargetFast(pRT=0x%08X)\n", pRT);
-            ++s_rtLog;
-        }
+        uint32_t cdev = X86_MEM_READ_u32(base, 0x35FB48u);
+        X86_MEM_WRITE_u32(base, cdev + 0x1A04, pRT);
+        // No DS arg in Fast variant; write 0 to keep the DS field consistent.
+        X86_MEM_WRITE_u32(base, cdev + 0x1A08, 0);
     }
-    if (pRT != 0) {
-        X86_MEM_WRITE_u32(base, kDeviceAddr + kDeviceRenderTarget, pRT);
-    }
+    X86_MEM_WRITE_u32(base, kDeviceAddr + 0x1A04, pRT);
+    X86_MEM_WRITE_u32(base, kDeviceAddr + kDeviceRenderTarget, pRT);
+
     g_d3d11.currentRTSurf = pRT;
+
+    if (PpDebug()) {
+        uint32_t pParent = pRT ? X86_MEM_READ_u32(base, pRT + 0x14) : 0;
+        bool inMap = g_d3d11.guestRTBySurface.count(pRT) != 0;
+        fprintf(stderr, "[PP] f=%u SetRTFast rt=0x%08X parent=0x%08X inMap=%d (prev=0x%08X had %u draws)\n",
+                g_ppFrame, pRT, pParent, (int)inMap, g_ppPrevRT, g_ppDrawsSinceRT);
+        g_ppPrevRT = pRT;
+        g_ppDrawsSinceRT = 0;
+    }
+
     GuestStackCleanup(ctx, 4);
 }
 
@@ -5290,7 +5634,8 @@ bool ResolveCopyRectsResource(uint8_t* base, uint32_t surfAddr, bool forWrite,
             if (rt) its->second.rt = rt;
         }
         if (rt && rt->texture) {
-            uint32_t mip = its->second.mip;
+            uint32_t mip = GetMipFromSurface(base, surfAddr, rt);
+            its->second.mip = mip;
             uint32_t w = std::max<uint32_t>(1, rt->baseW >> mip);
             uint32_t h = std::max<uint32_t>(1, rt->baseH >> mip);
             out.tex         = rt->texture;
@@ -5303,20 +5648,16 @@ bool ResolveCopyRectsResource(uint8_t* base, uint32_t surfAddr, bool forWrite,
     }
 
     // Last resort: surface points at a regular guest texture / image surface.
-    // Promote its parent to a GuestRT if the format is supported. EnsureGuestRT
-    // currently only handles A8R8G8B8 variants; for other formats we cannot
-    // serve as a copy source/destination on the GPU.
     uint32_t pParent = X86_MEM_READ_u32(base, surfAddr + 0x14);
     if (pParent != 0) {
         if (GuestRT* rt = EnsureGuestRT(base, pParent)) {
-            // Determine mip from order (matches D3D_CreateSurfaceOfTexture
-            // logic). Default to mip 0 if not yet registered.
-            SurfaceRTBind b{}; b.rt = rt; b.mip = 0;
+            uint32_t mip = GetMipFromSurface(base, surfAddr, rt);
+            SurfaceRTBind b{}; b.rt = rt; b.mip = mip; b.parent = pParent;
             g_d3d11.guestRTBySurface[surfAddr] = b;
-            uint32_t w = rt->baseW;
-            uint32_t h = rt->baseH;
+            uint32_t w = std::max<uint32_t>(1, rt->baseW >> mip);
+            uint32_t h = std::max<uint32_t>(1, rt->baseH >> mip);
             out.tex         = rt->texture;
-            out.subresource = 0;
+            out.subresource = D3D11CalcSubresource(mip, 0, rt->mipCount);
             out.width       = w;
             out.height      = h;
             out.format      = rt->dxgiFormat;
@@ -5509,8 +5850,22 @@ void D3DDevice_Release(X86Context& ctx, uint8_t* base) {
 }
 
 void D3DDevice_BeginVisibilityTest(X86Context& ctx, uint8_t* base) {
-    static bool logged = false;
-    if (!logged) { fprintf(stderr, "[HLE-STUB] D3DDevice_BeginVisibilityTest (0x0034DF40) called\n"); logged = true; }
+    // No arguments.  Start a new D3D11 occlusion query.
+    // If a previous Begin was never paired with an End, release it now.
+    if (g_visActiveQuery) {
+        if (g_d3d11.context) g_d3d11.context->End(g_visActiveQuery);
+        g_visActiveQuery->Release();
+        g_visActiveQuery = nullptr;
+    }
+    if (g_d3d11.device && g_d3d11.context) {
+        D3D11_QUERY_DESC qd = { D3D11_QUERY_OCCLUSION, 0 };
+        ID3D11Query* q = nullptr;
+        if (SUCCEEDED(g_d3d11.device->CreateQuery(&qd, &q))) {
+            g_d3d11.context->Begin(q);
+            g_visActiveQuery = q;
+        }
+    }
+    GuestReturn32(ctx, 0); // S_OK
     GuestStackCleanup(ctx, 0);
 }
 
@@ -5521,14 +5876,56 @@ void D3D_GetVisibilityAddress(X86Context& ctx, uint8_t* base) {
 }
 
 void D3DDevice_EndVisibilityTest(X86Context& ctx, uint8_t* base) {
-    static bool logged = false;
-    if (!logged) { fprintf(stderr, "[HLE-STUB] D3DDevice_EndVisibilityTest (0x0034DFE0) called\n"); logged = true; }
+    // __usercall: index is in EAX.  No stack args; callee cleanup = 0.
+    uint32_t index = ctx.eax;
+    if (g_visActiveQuery && g_d3d11.context) {
+        g_d3d11.context->End(g_visActiveQuery);
+        auto& slot = g_visSlots[index];
+        if (slot.query) slot.query->Release();
+        slot.query = g_visActiveQuery;
+        slot.count = 0;
+        slot.ready = false;
+        g_visActiveQuery = nullptr;
+    }
+    GuestReturn32(ctx, 0); // S_OK
     GuestStackCleanup(ctx, 0);
 }
 
 void D3DDevice_GetVisibilityTestResult(X86Context& ctx, uint8_t* base) {
-    static bool logged = false;
-    if (!logged) { fprintf(stderr, "[HLE-STUB] D3DDevice_GetVisibilityTestResult (0x0034E040) called\n"); logged = true; }
+    // __userpurge: a1(index) in EAX, a2(pResult[2]) in EDX, a3(pCount) on stack.
+    // Returns S_OK (0) on success, 0x88760028 if the result is not yet ready.
+    uint32_t index  = ctx.eax;
+    uint32_t a2Ptr  = ctx.edx;               // optional DWORD[2] out (fence info)
+    uint32_t a3Ptr  = GuestArg32(ctx, base, 0); // required DWORD out (pixel count)
+
+    auto it = g_visSlots.find(index);
+    if (it != g_visSlots.end() && it->second.query && g_d3d11.context) {
+        auto& slot = it->second;
+        if (!slot.ready) {
+            UINT64 data = 0;
+            HRESULT hr = g_d3d11.context->GetData(slot.query, &data, sizeof(data), 0);
+            if (hr == S_FALSE) {
+                // Result not yet available — return Xbox "not ready" HRESULT.
+                GuestReturn32(ctx, 0x88760028u);
+                GuestStackCleanup(ctx, 4);
+                return;
+            }
+            if (SUCCEEDED(hr)) {
+                slot.count = data;
+                slot.ready = true;
+            }
+        }
+        if (a3Ptr) X86_MEM_WRITE_u32(base, a3Ptr, (uint32_t)slot.count);
+    } else {
+        // No query for this slot — treat as fully visible.
+        if (a3Ptr) X86_MEM_WRITE_u32(base, a3Ptr, 1u);
+    }
+    // a2 carries Xbox fence/timing info we don't emulate; zero it if present.
+    if (a2Ptr) {
+        X86_MEM_WRITE_u32(base, a2Ptr,     0u);
+        X86_MEM_WRITE_u32(base, a2Ptr + 4, 0u);
+    }
+    GuestReturn32(ctx, 0); // S_OK
     GuestStackCleanup(ctx, 4);
 }
 
@@ -5561,20 +5958,90 @@ void D3DDevice_DeletePixelShader(X86Context& ctx, uint8_t* base) {
 // translated PS reads them from cbuffer psC[0..15] — the draw path
 // (HLE_Draw3D) uploads g_pshConstants[] into cbPS just before PSSetShader.
 void D3DDevice_SetPixelShaderConstant(X86Context& ctx, uint8_t* base) {
-    uint32_t regStart = ctx.ecx;
-    uint32_t count    = ctx.eax;                 // number of float4 vectors
-    uint32_t pData    = GuestArg32(ctx, base, 0); // guest pointer to float4 data
+    uint32_t regStart = 0;
+    uint32_t count = 0;
+    uint32_t pData = 0;
+    
+    // Grab typical registers and stack args
+    uint32_t arg0 = GuestArg32(ctx, base, 0);
+    uint32_t arg1 = GuestArg32(ctx, base, 1);
+    uint32_t arg2 = GuestArg32(ctx, base, 2);
+
+    // Pattern 1: LTCG fastcall (ECX=Reg, EAX=Count, Stack0=pData)
+    if (ctx.ecx < 16 && ctx.eax > 0 && ctx.eax <= 16 && arg0 >= 0x10000) {
+        regStart = ctx.ecx;
+        count = ctx.eax;
+        pData = arg0;
+        GuestStackCleanup(ctx, 4);
+    } 
+    // Pattern 2: __fastcall (ECX=Reg, EDX=pData, Stack0=Count)
+    else if (ctx.ecx < 16 && ctx.edx >= 0x10000 && arg0 > 0 && arg0 <= 16) {
+        regStart = ctx.ecx;
+        pData = ctx.edx;
+        count = arg0;
+        GuestStackCleanup(ctx, 4);
+    }
+    // Pattern 3: stdcall (Register, pData, Count)
+    else if (arg0 < 16 && arg1 >= 0x10000 && arg2 > 0 && arg2 <= 16) {
+        regStart = arg0;
+        pData = arg1;
+        count = arg2;
+        GuestStackCleanup(ctx, 12);
+    }
+    // Pattern 4: IDA scrambled stdcall (Register, Count, pData)
+    else if (arg0 < 16 && arg2 >= 0x10000 && arg1 > 0 && arg1 <= 16) {
+        regStart = arg0;
+        count = arg1;
+        pData = arg2;
+        GuestStackCleanup(ctx, 12);
+    }
+    // Pattern 5: IDA scrambled stdcall (Count, Register, pData) -> FIXES BLOOM
+    else if (arg0 > 0 && arg0 <= 16 && arg1 < 16 && arg2 >= 0x10000) {
+        count = arg0;
+        regStart = arg1;
+        pData = arg2;
+        GuestStackCleanup(ctx, 12);
+    }
+    // Pattern 6: IDA scrambled stdcall (Register, 0, pData) -> Assume Count = 1
+    else if (arg0 < 16 && arg2 >= 0x10000 && arg1 == 0) {
+        regStart = arg0;
+        count = 1;
+        pData = arg2;
+        GuestStackCleanup(ctx, 12);
+    }
+    // Pattern 7: __fastcall without count (ECX=Reg, EDX=pData) -> Assume Count = 1
+    else if (ctx.ecx < 16 && ctx.edx >= 0x10000) {
+        regStart = ctx.ecx;
+        pData = ctx.edx;
+        count = 1;
+        GuestStackCleanup(ctx, 0); 
+    }
+    // Pattern 8: __fastcall with EAX=pData
+    else if (ctx.ecx < 16 && ctx.eax >= 0x10000) {
+        regStart = ctx.ecx;
+        pData = ctx.eax;
+        count = 1;
+        GuestStackCleanup(ctx, 0);
+    }
+    // Pattern 9: fastcall (ECX=Reg, EDX=Count, Stack0=pData) with Count=0
+    else if (ctx.ecx < 16 && arg0 >= 0x10000 && ctx.edx == 0) {
+        regStart = ctx.ecx;
+        count = 1;
+        pData = arg0;
+        GuestStackCleanup(ctx, 4);
+    }
+    else {
+        // Fallback: Avoid crashing 
+        GuestStackCleanup(ctx, 12);
+        return;
+    }
 
     if (pData != 0 && count > 0 && regStart < 16) {
-        uint32_t copyCount = count;
-        if (regStart + copyCount > 16)
-            copyCount = 16 - regStart;
+        uint32_t copyCount = std::min<uint32_t>(count, 16 - regStart);
         memcpy(&g_pshConstants[regStart][0], base + pData, copyCount * 16);
         for (uint32_t i = 0; i < copyCount; ++i)
             g_pshConstantsDirty |= (1u << (regStart + i));
     }
-
-    GuestStackCleanup(ctx, 4);
 }
 
 void D3D_InitializeVertexShaderFromFvf(X86Context& ctx, uint8_t* base) {
@@ -5623,6 +6090,19 @@ void D3DDevice_DeleteVertexShader(X86Context& ctx, uint8_t* base) {
 // vertex program (screen-space 2D rendering).  In our HLE the 2D vs 3D
 // pipeline switch is driven by the draw call itself, so this is a no-op.
 void D3D_CommonSetPassthroughProgram(X86Context& ctx, uint8_t* base) {
+    g_currentVSHandle = 0;
+    g_currentPSHandle = 0;
+
+    uint32_t cdev = X86_MEM_READ_u32(base, 0x35FB48u);
+    if (cdev != 0) {
+        cdev &= 0x3FFFFFFFu;
+        X86_MEM_WRITE_u32(base, cdev + 0x798u, 0);
+    }
+    
+    // Invalidate Burnout 3's custom VS cache
+    X86_MEM_WRITE_u32(base, 0x41AAB8, 0xFFFFFFFF);
+    X86_MEM_WRITE_u32(base, 0x41AABC, 0xFFFFFFFF);
+    
     GuestStackCleanup(ctx, 0);
 }
 
@@ -5648,136 +6128,69 @@ static inline void CaptureVshConstants(uint8_t* base, uint32_t reg,
         // Also mirror into guest shadow
         memcpy(base + kVshConstantShadow + reg * 16, src, dstMax * 16);
     }
-    static int s_logCap = 0;
-    // Track first-write per register so we see EVERY distinct slot the game
-    // touches without flooding the log.
-    static bool s_seen[192] = {};
-    bool firstSeen = (reg < 192) && !s_seen[reg];
-    if (firstSeen) s_seen[reg] = true;
-    bool touchesMvp = (reg < 116) && (reg + count4s > 112);
-
-    // MVP-targeted diagnostic: log EVERY upload that overlaps c[112..115]
-    // where at least one float is non-zero, tracking distinct (source-addr,
-    // first-row-hash) tuples so we can identify any real MVP buffer beyond
-    // the known-dead 0x004D6730. Cap at ~32 distinct tuples to bound log.
-    if (touchesMvp) {
-        bool anyNonZero = false;
-        for (uint32_t i = 0; i < dstMax * 4; i++) {
-            if (src[i] != 0.0f) { anyNonZero = true; break; }
-        }
-        // ---- Debug: B3_DEBUG_MVP_UPLOADS — dump every distinct source
-        // addr that uploads into reg=112..115 (INCLUDING all-zero uploads)
-        // so we can enumerate call sites rather than only ones that happen
-        // to carry non-zero data.
-        if (g_dbg.mvpUploads) {
-            uint64_t h = 1469598103934665603ull;
-            const uint32_t* pw = reinterpret_cast<const uint32_t*>(src);
-            for (uint32_t i = 0; i < dstMax * 4; i++) {
-                h ^= pw[i]; h *= 1099511628211ull;
-            }
-            struct DbgSeen { uint32_t srcAddr; uint64_t hash; uint32_t hits; };
-            static std::vector<DbgSeen> s_seenDbg;
-            static uint32_t s_totalCalls = 0;
-            ++s_totalCalls;
-            bool novel = true;
-            for (auto& ms : s_seenDbg) {
-                if (ms.srcAddr == pData && ms.hash == h) {
-                    ms.hits++;
-                    novel = false;
-                    break;
-                }
-            }
-            if (novel && s_seenDbg.size() < 32) {
-                s_seenDbg.push_back({pData, h, 1});
-                fprintf(stderr,
-                    "[MVPUP] total=%u distinct=%u reg=%u cnt=%u src=0x%08X nonzero=%d\n",
-                    s_totalCalls, (unsigned)s_seenDbg.size(),
-                    reg, count4s, pData, anyNonZero ? 1 : 0);
-                for (uint32_t i = 0; i < dstMax && i < 4; i++) {
-                    fprintf(stderr,
-                        "       row%u c[%u] = [%8.4f %8.4f %8.4f %8.4f]\n",
-                        i, reg + i,
-                        src[i*4+0], src[i*4+1], src[i*4+2], src[i*4+3]);
-                }
-                // Dump 384 bytes of surrounding memory, formatted as
-                // 4x4 float matrices at every 64-byte offset from
-                // pData - 256 to pData + 64. RenderWare's atomic transform
-                // block typically stores { world[64], view[64], proj[64],
-                // wvp[64] } contiguously.
-                fprintf(stderr, "       surrounding memory (pData=0x%08X):\n", pData);
-                for (int32_t off = -256; off <= 64; off += 64) {
-                    uint32_t a = pData + off;
-                    if (a < 0x10000 || a + 64 > 0x20000000) continue;
-                    const float* mm = reinterpret_cast<const float*>(base + a);
-                    // Skip printing all-zero blocks to reduce noise
-                    bool nz = false;
-                    for (int k = 0; k < 16; k++) if (mm[k] != 0.0f) { nz = true; break; }
-                    if (!nz) {
-                        fprintf(stderr, "        +%+4d 0x%08X: (all zero)\n", off, a);
-                        continue;
-                    }
-                    fprintf(stderr,
-                        "        +%+4d 0x%08X: [%7.3f %7.3f %7.3f %7.3f | %7.3f %7.3f %7.3f %7.3f | %7.3f %7.3f %7.3f %7.3f | %7.3f %7.3f %7.3f %7.3f]\n",
-                        off, a,
-                        mm[0],mm[1],mm[2],mm[3],
-                        mm[4],mm[5],mm[6],mm[7],
-                        mm[8],mm[9],mm[10],mm[11],
-                        mm[12],mm[13],mm[14],mm[15]);
-                }
-            }
-        }
-        if (anyNonZero) {
-            uint64_t h = 1469598103934665603ull;
-            const uint32_t* pw = reinterpret_cast<const uint32_t*>(src);
-            for (uint32_t i = 0; i < dstMax * 4; i++) { h ^= pw[i]; h *= 1099511628211ull; }
-            struct MvpSeen { uint32_t srcAddr; uint64_t hash; uint32_t count; };
-            static std::vector<MvpSeen> s_mvpSeen;
-            bool novel = true;
-            for (auto& ms : s_mvpSeen) {
-                if (ms.srcAddr == pData && ms.hash == h) { ms.count++; novel = false; break; }
-            }
-            if (novel && s_mvpSeen.size() < 32) {
-                s_mvpSeen.push_back({pData, h, 1});
-                fprintf(stderr, "[HLE] **MVP-UPLOAD** reg=%u cnt=%u src=0x%08X  (distinct=%u)\n",
-                        reg, count4s, pData, (uint32_t)s_mvpSeen.size());
-                for (uint32_t i = 0; i < dstMax && i < 4; i++) {
-                    fprintf(stderr, "       row%u c[%u] = [%.4f %.4f %.4f %.4f]\n",
-                            i, reg + i, src[i*4+0], src[i*4+1], src[i*4+2], src[i*4+3]);
-                }
-            }
-        }
-    }
-    if (firstSeen || touchesMvp || s_logCap < 32) {
-        // fprintf(stderr, "[HLE] VshConst reg=%u count=%u src=0x%08X first=[%.3f %.3f %.3f %.3f]%s%s\n",
-        //         reg, count4s, pData, src[0], src[1], src[2], src[3],
-        //         touchesMvp ? "  <-- MVP range" : "",
-        //         firstSeen ? "  (FIRST)" : "");
-        // Dump full payload the FIRST time we see a multi-vec4 write so we
-        // can sanity-check whether "the matrix is really zero" or whether
-        // only row0 happens to be zero.
-        if (firstSeen && count4s >= 2) {
-            for (uint32_t i = 0; i < count4s; i++) {
-                fprintf(stderr, "       row%u c[%u] = [%.4f %.4f %.4f %.4f]\n",
-                        i, reg + i, src[i*4+0], src[i*4+1], src[i*4+2], src[i*4+3]);
-            }
-        }
-        s_logCap++;
-    }
 }
 
 void D3DDevice_SetVertexShaderConstant1(X86Context& ctx, uint8_t* base) {
-    CaptureVshConstants(base, ctx.ecx, ctx.edx, 1);
-    GuestStackCleanup(ctx, 0);
+    uint32_t arg0 = GuestArg32(ctx, base, 0);
+    uint32_t arg1 = GuestArg32(ctx, base, 1);
+    uint32_t reg = 0, pData = 0;
+    
+    if (ctx.ecx < 192 && ctx.edx >= 0x10000) {
+        reg = ctx.ecx;
+        pData = ctx.edx;
+        GuestStackCleanup(ctx, 0);
+    } else if (arg0 < 192 && arg1 >= 0x10000) {
+        reg = arg0;
+        pData = arg1;
+        GuestStackCleanup(ctx, 8);
+    } else {
+        GuestStackCleanup(ctx, 0);
+        return;
+    }
+
+    CaptureVshConstants(base, reg, pData, 1);
 }
 
 void D3DDevice_SetVertexShaderConstant1Fast(X86Context& ctx, uint8_t* base) {
-    CaptureVshConstants(base, ctx.ecx, ctx.edx, 1);
-    GuestStackCleanup(ctx, 0);
+    uint32_t arg0 = GuestArg32(ctx, base, 0);
+    uint32_t arg1 = GuestArg32(ctx, base, 1);
+    uint32_t reg = 0, pData = 0;
+    
+    if (ctx.ecx < 192 && ctx.edx >= 0x10000) {
+        reg = ctx.ecx;
+        pData = ctx.edx;
+        GuestStackCleanup(ctx, 0);
+    } else if (arg0 < 192 && arg1 >= 0x10000) {
+        reg = arg0;
+        pData = arg1;
+        GuestStackCleanup(ctx, 8);
+    } else {
+        GuestStackCleanup(ctx, 0);
+        return;
+    }
+
+    CaptureVshConstants(base, reg, pData, 1);
 }
 
 void D3DDevice_SetVertexShaderConstant4(X86Context& ctx, uint8_t* base) {
-    CaptureVshConstants(base, ctx.ecx, ctx.edx, 4);
-    GuestStackCleanup(ctx, 0);
+    uint32_t arg0 = GuestArg32(ctx, base, 0);
+    uint32_t arg1 = GuestArg32(ctx, base, 1);
+    uint32_t reg = 0, pData = 0;
+    
+    if (ctx.ecx < 192 && ctx.edx >= 0x10000) {
+        reg = ctx.ecx;
+        pData = ctx.edx;
+        GuestStackCleanup(ctx, 0);
+    } else if (arg0 < 192 && arg1 >= 0x10000) {
+        reg = arg0;
+        pData = arg1;
+        GuestStackCleanup(ctx, 8);
+    } else {
+        GuestStackCleanup(ctx, 0);
+        return;
+    }
+
+    CaptureVshConstants(base, reg, pData, 4);
 }
 
 // D3DDevice_SetVertexShaderConstantNotInlineFast  (0x34F9A0) — __fastcall:
@@ -5853,8 +6266,7 @@ void D3D_CreateSurfaceOfTexture(X86Context& ctx, uint8_t* base) {
     if (pParent != 0) {
         uint32_t pFmt = X86_MEM_READ_u32(base, pParent + 12);
         uint8_t  xF   = (pFmt >> X_D3DFORMAT_FORMAT_SHIFT) & 0xFF;
-        if (xF == X_D3DFMT_A8R8G8B8 || xF == X_D3DFMT_LIN_A8R8G8B8 ||
-+            xF == X_D3DFMT_X8R8G8B8 || xF == X_D3DFMT_LIN_X8R8G8B8) {
+        if (IsRTFormat(xF)) {
             // Count existing surfaces already registered for this parent;
             // that becomes the mip level for the new surface. NB: the rt
             // pointer is still null at registration time (filled lazily on
@@ -5876,6 +6288,28 @@ void D3D_CreateSurfaceOfTexture(X86Context& ctx, uint8_t* base) {
             fprintf(stderr, "[D3D11] track RT-surface 0x%08X parent=0x%08X mip=%u\n",
                     surfAddr, pParent, mipLevel);
         }
+        // if (xF == X_D3DFMT_A8R8G8B8 || xF == X_D3DFMT_LIN_A8R8G8B8) {
+        //     // Count existing surfaces already registered for this parent;
+        //     // that becomes the mip level for the new surface. NB: the rt
+        //     // pointer is still null at registration time (filled lazily on
+        //     // first SetRenderTarget), so DO NOT gate on `kv.second.rt` —
+        //     // doing so makes every surface come back as mip 0, which silently
+        //     // routes the entire bloom downsample chain into mip 0 and breaks
+        //     // post-FX (bloom / motion blur / reflections / lens flare).
+        //     uint32_t mipLevel = 0;
+        //     for (auto& kv : g_d3d11.guestRTBySurface) {
+        //         if (kv.second.parent == pParent) ++mipLevel;
+        //     }
+        //     // Register a placeholder; the GuestRT itself is created lazily
+        //     // when SetRenderTarget actually targets one of these surfaces.
+        //     SurfaceRTBind b;
+        //     b.rt     = nullptr;
+        //     b.mip    = mipLevel;
+        //     b.parent = pParent;
+        //     g_d3d11.guestRTBySurface[surfAddr] = b;
+        //     fprintf(stderr, "[D3D11] track RT-surface 0x%08X parent=0x%08X mip=%u\n",
+        //             surfAddr, pParent, mipLevel);
+        // }
     }
 
     GuestReturn32(ctx, surfAddr);
@@ -5959,14 +6393,6 @@ void D3D_MMXMemCpyDwordBlock(X86Context& ctx, uint8_t* base) {
     GuestStackCleanup(ctx, 12);
 }
 
-// ---- Minimal software triangle rasterizer for 2D pre-transformed verts ----
-// Xbox NV2A primitive types used by RenderWare im2d
-static constexpr uint32_t NV2A_PRIM_TRIANGLES = 5;
-static constexpr uint32_t NV2A_PRIM_TRISTRIP  = 6;
-static constexpr uint32_t NV2A_PRIM_TRIFAN    = 7;
-static constexpr uint32_t NV2A_PRIM_QUADS     = 8;
-static constexpr uint32_t NV2A_PRIM_QUADSTRIP = 9;
-
 // ============================================================================
 // D3D11 texture helpers
 // ============================================================================
@@ -6003,6 +6429,27 @@ static void UnswizzleTexture(const uint8_t* src, uint8_t* dst,
 static ID3D11ShaderResourceView* GetOrCreateTextureSRV(uint8_t* base, uint32_t xboxTexAddr);
 
 // Ensure a D3D11 RT-capable texture exists for the parent guest texture
+// Read width/height from an NV2A texture header in guest memory.
+// Uses the same sizeField/fmtField encoding as EnsureGuestRT.
+// Returns false if the address is 0 or dimensions look bogus.
+static bool GetGuestTexDims(uint8_t* base, uint32_t addr, uint32_t& w, uint32_t& h)
+{
+    w = h = 0;
+    if (!addr || !base) return false;
+    uint32_t fmtField  = X86_MEM_READ_u32(base, addr + 12);
+    uint32_t sizeField = X86_MEM_READ_u32(base, addr + 16);
+    if (sizeField != 0) {
+        w = (sizeField & X_D3DSIZE_WIDTH_MASK) + 1;
+        h = ((sizeField & X_D3DSIZE_HEIGHT_MASK) >> X_D3DSIZE_HEIGHT_SHIFT) + 1;
+    } else {
+        uint32_t logU = (fmtField >> X_D3DFORMAT_USIZE_SHIFT) & 0xF;
+        uint32_t logV = (fmtField >> X_D3DFORMAT_VSIZE_SHIFT) & 0xF;
+        w = 1u << logU;
+        h = 1u << logV;
+    }
+    return (w >= 2 && h >= 2 && w <= 4096 && h <= 4096);
+}
+
 // `parentTexAddr`. Creates the underlying ID3D11Texture2D with full mip
 // chain, both BIND_RENDER_TARGET | BIND_SHADER_RESOURCE, plus per-mip RTVs
 // and a full-chain SRV. Returns the GuestRT* (cached) or nullptr if the
@@ -6019,10 +6466,15 @@ static GuestRT* EnsureGuestRT(uint8_t* base, uint32_t parentTexAddr)
     uint32_t dataAddr  = X86_MEM_READ_u32(base, parentTexAddr + 4);
     uint8_t  xFmt      = (fmtField >> X_D3DFORMAT_FORMAT_SHIFT) & 0xFF;
 
-    // Handle A8R8G8B8 and X8R8G8B8 (swizzled or linear). Burnout 3 uses
-    // X8R8G8B8 for several opaque render targets (e.g., tonemapping).
-    if (xFmt != X_D3DFMT_A8R8G8B8 && xFmt != X_D3DFMT_LIN_A8R8G8B8 &&
-        xFmt != X_D3DFMT_X8R8G8B8 && xFmt != X_D3DFMT_LIN_X8R8G8B8) return nullptr;
+    if (!IsRTFormat(xFmt)) {
+        static int s_fmtLog = 0;
+        if (s_fmtLog < 16) {
+            fprintf(stderr, "[D3D11] EnsureGuestRT: parent=0x%08X xFmt=0x%02X not RT-capable\n",
+                    parentTexAddr, xFmt);
+            ++s_fmtLog;
+        }
+        return nullptr;
+    }
 
     uint32_t baseW, baseH;
     if (sizeField != 0) {
@@ -6075,6 +6527,7 @@ static GuestRT* EnsureGuestRT(uint8_t* base, uint32_t parentTexAddr)
                parentTexAddr, baseW, baseH, mipCount);
 
     rt->rtvPerMip.resize(mipCount, nullptr);
+    rt->srvPerMip.resize(mipCount, nullptr);
     for (uint32_t m = 0; m < mipCount; ++m) {
         D3D11_RENDER_TARGET_VIEW_DESC rd = {};
         rd.Format             = rt->dxgiFormat;
@@ -6084,6 +6537,17 @@ static GuestRT* EnsureGuestRT(uint8_t* base, uint32_t parentTexAddr)
         hr = g_d3d11.device->CreateRenderTargetView(rt->texture, &rd, &rtv);
         if (SUCCEEDED(hr)) rt->rtvPerMip[m] = rtv;
         SetD3DName(rtv, "B3_GuestRTV_parent_%08X_mip%u", parentTexAddr, m);
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC sm = {};
+        sm.Format                    = rt->dxgiFormat;
+        sm.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sm.Texture2D.MostDetailedMip = m;
+        sm.Texture2D.MipLevels       = 1;
+        ID3D11ShaderResourceView* sv = nullptr;
+        if (SUCCEEDED(g_d3d11.device->CreateShaderResourceView(rt->texture, &sm, &sv))) {
+            rt->srvPerMip[m] = sv;
+            SetD3DName(sv, "B3_GuestRT_SRV_mip%u_parent_%08X", m, parentTexAddr);
+        }
     }
 
     D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
@@ -6122,9 +6586,85 @@ static GuestRT* EnsureGuestRT(uint8_t* base, uint32_t parentTexAddr)
         }
     }
 
+    // Create per-GuestRT depth buffer so 3D scene draws get depth testing.
+    // Each mip level of the color RT maps to a matching mip of the depth
+    // texture (mip dimensions are baseW>>m x baseH>>m).
+    {
+        D3D11_TEXTURE2D_DESC dtd = {};
+        dtd.Width            = baseW;
+        dtd.Height           = baseH;
+        dtd.MipLevels        = mipCount;
+        dtd.ArraySize        = 1;
+        dtd.Format           = DXGI_FORMAT_R24G8_TYPELESS;
+        dtd.SampleDesc.Count = 1;
+        dtd.Usage            = D3D11_USAGE_DEFAULT;
+        dtd.BindFlags        = D3D11_BIND_DEPTH_STENCIL;
+        rt->dsvPerMip.resize(mipCount, nullptr);
+        if (SUCCEEDED(g_d3d11.device->CreateTexture2D(&dtd, nullptr, &rt->depthTex))) {
+            SetD3DName(rt->depthTex, "B3_GuestRT_Depth_parent_%08X_%ux%u",
+                       parentTexAddr, baseW, baseH);
+            for (uint32_t m = 0; m < mipCount; ++m) {
+                D3D11_DEPTH_STENCIL_VIEW_DESC dvd = {};
+                dvd.Format             = DXGI_FORMAT_D24_UNORM_S8_UINT;
+                dvd.ViewDimension      = D3D11_DSV_DIMENSION_TEXTURE2D;
+                dvd.Texture2D.MipSlice = m;
+                ID3D11DepthStencilView* dsv = nullptr;
+                if (SUCCEEDED(g_d3d11.device->CreateDepthStencilView(rt->depthTex, &dvd, &dsv)))
+                    rt->dsvPerMip[m] = dsv;
+            }
+            // Pre-clear all depth mips to far (1.0) so first draw is correct.
+            if (g_d3d11.context) {
+                for (uint32_t m = 0; m < mipCount; ++m) {
+                    if (rt->dsvPerMip[m])
+                        g_d3d11.context->ClearDepthStencilView(rt->dsvPerMip[m],
+                            D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+                }
+            }
+        }
+    }
+
     g_d3d11.guestRTByParent[parentTexAddr]   = rt;
-    if (dataAddr != 0)
-        g_d3d11.guestRTByDataAddr[dataAddr] = rt;
+    if (dataAddr != 0) {
+        uint8_t fmtInfo = XboxFormatInfo(rt->xFmt);
+        uint32_t bppField = fmtInfo & 0x3C;
+        bool isDXT = IsCompressedFormat(rt->xFmt);
+        uint32_t compMin = isDXT ? 2 : 0;
+        
+        uint32_t logU = (rt->fmtField >> X_D3DFORMAT_USIZE_SHIFT) & 0xF;
+        uint32_t logV = (rt->fmtField >> X_D3DFORMAT_VSIZE_SHIFT) & 0xF;
+        uint32_t logP = (rt->fmtField >> X_D3DFORMAT_PSIZE_SHIFT) & 0xF;
+
+        for (uint32_t m = 0; m < mipCount; ++m) {
+            uint32_t offset = 0;
+            uint32_t tU = logU, tV = logV, tP = logP;
+            for (uint32_t i = 0; i < m; ++i) {
+                uint32_t curU = (tU > compMin) ? tU : compMin;
+                uint32_t curV = (tV > compMin) ? tV : compMin;
+                uint32_t levelBits = curU + curV + tP;
+                offset += (1u << levelBits) * bppField / 8;
+                if (tU > 0) tU--;
+                if (tV > 0) tV--;
+                if (tP > 0) tP--;
+            }
+            offset = (offset + 127) & ~127u; // Xbox mip sizes are rounded to 128-byte block sizes iteratively
+            
+            GuestRTBind bind;
+            bind.rt = rt;
+            bind.mip = m;
+            g_d3d11.guestRTByDataAddr[(dataAddr + offset) & 0x0FFFFFFF] = bind;
+        }
+    }
+
+    // Register actual surface data addresses to support custom allocations
+    for (const auto& kv : g_d3d11.guestRTBySurface) {
+        if (kv.second.parent == parentTexAddr) {
+            uint32_t surfData = X86_MEM_READ_u32(base, kv.first + 4) & 0x0FFFFFFF;
+            GuestRTBind bind;
+            bind.rt = rt;
+            bind.mip = kv.second.mip;
+            g_d3d11.guestRTByDataAddr[surfData] = bind;
+        }
+    }
 
     fprintf(stderr, "[D3D11] EnsureGuestRT: parent=0x%08X data=0x%08X %ux%u mips=%u srv=%p\n",
             parentTexAddr, dataAddr, baseW, baseH, mipCount, (void*)rt->srv);
@@ -6144,27 +6684,48 @@ static ID3D11ShaderResourceView* ResolveNV2ATextureSRV(uint8_t* base, uint32_t s
 {
     if (stage >= 4) return nullptr;
     const NV2ATextureState& st = g_nv2aTexture[stage];
-    if (st.offset == 0 || st.format == 0) return nullptr;
+    
+    if (st.offset == 0) return nullptr;
 
-    // NV097_SET_TEXTURE_FORMAT matches the Xbox X_D3DFORMAT layout 1:1
-    // (colour code at bits 8..15, logU/V at 20..27, mipmap at 16..19) — the
-    // SDK literally copies header->fmtField into the pushbuffer method.
-    uint32_t fmt  = st.format;
-    uint32_t xFmt = (fmt >> X_D3DFORMAT_FORMAT_SHIFT) & 0xFF;
+    uint32_t dataAddr = st.offset & 0x0FFFFFFF;
+    if (dataAddr == 0) return nullptr;
 
-    // Diagnostic: capture NV097 format bits once per unique format, so we
-    // can see whether the cubemap bit (0x04) is ever asserted and also
-    // track the dimensionality nibble.
-    {
-        static std::unordered_set<uint32_t> s_seenFmt;
-        if (s_seenFmt.insert(fmt).second && s_seenFmt.size() <= 128) {
-            fprintf(stderr, "[NV2A tex] stage=%u fmt=0x%08X (lowBits=0x%02X xFmt=0x%02X cube=%d dim=%u) offset=0x%08X rect=0x%08X ctl1=0x%08X\n",
-                    stage, fmt, fmt & 0xFFu, xFmt,
-                    (int)((fmt & 0x04u) != 0),
-                    (fmt >> 4) & 0xFu,
-                    st.offset, st.imageRect, st.control1);
+    // Detect if this dataAddr belongs to the back buffer for Post-FX
+    uint32_t activeRTData = 0;
+    uint32_t rtAddr = g_d3d11.currentRTSurf;
+    if (rtAddr == 0) rtAddr = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceRenderTarget);
+    if (rtAddr == 0) rtAddr = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceBackBufBase);
+    if (rtAddr != 0) activeRTData = X86_MEM_READ_u32(base, rtAddr + 4);
+
+    for (int i = 0; i < 4; ++i) {
+        uint32_t bbAddr = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceBackBufBase + i * 4);
+        if (bbAddr != 0) {
+            uint32_t bbData = X86_MEM_READ_u32(base, bbAddr + 4);
+            if (dataAddr == bbData) {
+                if (dataAddr == activeRTData) {
+                    return g_d3d11.sceneSRV; // Active RT => feedback loop (Hazard mitigation uses scratch)
+                } else {
+                    return g_d3d11.sceneSRV; // Sample current frame (post-bloom) for radial/directional blur
+                }
+            }
         }
     }
+
+    // GuestRT checks (Fast-path for bloom/blur mipmaps)
+    auto itD = g_d3d11.guestRTByDataAddr.find(dataAddr);
+    if (itD != g_d3d11.guestRTByDataAddr.end() && itD->second.rt) {
+        if (itD->second.mip == 0) {
+            return itD->second.rt->srv;
+        } else if (itD->second.mip < itD->second.rt->srvPerMip.size()) {
+            return itD->second.rt->srvPerMip[itD->second.mip];
+        }
+    }
+
+    // If it's a regular texture (not an RT), we MUST have a format to proceed.
+    if (st.format == 0) return nullptr;
+
+    uint32_t fmt  = st.format;
+    uint32_t xFmt = (fmt >> X_D3DFORMAT_FORMAT_SHIFT) & 0xFF;
 
     auto isLinear = [](uint32_t f) {
         switch (f) {
@@ -6177,7 +6738,6 @@ static ID3D11ShaderResourceView* ResolveNV2ATextureSRV(uint8_t* base, uint32_t s
 
     uint32_t sizeField = 0;
     if (isLinear(xFmt) && st.imageRect != 0) {
-        // NV097 image-rect = (width << 16) | height (absolute, not -1).
         uint32_t w = (st.imageRect >> 16) & 0xFFFF;
         uint32_t h = (st.imageRect >>  0) & 0xFFFF;
         if (w == 0 || h == 0 || w > 4096 || h > 4096) return nullptr;
@@ -6188,11 +6748,7 @@ static ID3D11ShaderResourceView* ResolveNV2ATextureSRV(uint8_t* base, uint32_t s
                   | ((((pitch64 - 1) & 0xFF)) << X_D3DSIZE_PITCH_SHIFT);
     }
 
-    uint32_t dataAddr = st.offset & 0x0FFFFFFF;
-    if (dataAddr == 0) return nullptr;
-
-    // Allocate one synthetic header per (dataAddr, fmt, sizeField) so the
-    // downstream cache keyed on header-address never thrashes.
+    // Allocate one synthetic header per (dataAddr, fmt, sizeField)
     struct NvKey { uint32_t a, b, c; };
     struct H { size_t operator()(const NvKey& k) const noexcept {
         return std::hash<uint64_t>()((uint64_t)k.a ^ ((uint64_t)k.b << 1) ^ ((uint64_t)k.c << 33));
@@ -6228,29 +6784,35 @@ static ID3D11ShaderResourceView* GetOrCreateTextureSRV(uint8_t* base, uint32_t x
 {
     if (!g_d3d11.initialized || xboxTexAddr == 0) return nullptr;
 
-    uint32_t dataAddr  = X86_MEM_READ_u32(base, xboxTexAddr + 4);
+    // Strip Xbox physical-address flag bits (high nibble), same as ResolveNV2ATextureSRV.
+    uint32_t dataAddr  = X86_MEM_READ_u32(base, xboxTexAddr + 4) & 0x0FFFFFFFu;
     uint32_t fmtField  = X86_MEM_READ_u32(base, xboxTexAddr + 12);
     uint32_t sizeField = X86_MEM_READ_u32(base, xboxTexAddr + 16);
     if (dataAddr == 0) return nullptr;
 
-    // Check if sampling backbuffer
+    // Detect if this dataAddr belongs to the back buffer for Post-FX.
+    // Both sides of the comparison must be masked the same way as dataAddr so
+    // that ContigAlloc pixel-buffer addresses in the 0x1C000000+ range
+    // (high nibble non-zero after 28-bit mask) still compare equal.
+    uint32_t activeRTData = 0;
+    uint32_t rtAddr = g_d3d11.currentRTSurf;
+    if (rtAddr == 0) rtAddr = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceRenderTarget);
+    if (rtAddr == 0) rtAddr = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceBackBufBase);
+    if (rtAddr != 0) activeRTData = X86_MEM_READ_u32(base, rtAddr + 4) & 0x0FFFFFFFu;
+
     for (int i = 0; i < 4; ++i) {
-        uint32_t bbSurf = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceBackBufBase + i * 4);
-        if (bbSurf != 0 && dataAddr == X86_MEM_READ_u32(base, bbSurf + 4)) {
-            static bool s_diag_enabled = std::getenv("B3_DIAG_POSTFX") != nullptr;
-            if (s_diag_enabled) {
-                fprintf(stderr, "[DIAG] GetOrCreateTextureSRV: Matched BackBuffer at data 0x%08X\n", dataAddr);
+        uint32_t bbAddr = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceBackBufBase + i * 4);
+        if (bbAddr != 0) {
+            uint32_t bbData = X86_MEM_READ_u32(base, bbAddr + 4) & 0x0FFFFFFFu;
+            if (dataAddr == bbData) {
+                if (dataAddr == activeRTData) {
+                    return g_d3d11.sceneSRV; // Active RT => feedback loop (Hazard mitigation uses scratch)
+                } else {
+                    return g_d3d11.sceneSRV; // Sample current frame (post-bloom) for radial/directional blur
+                }
             }
-            return g_d3d11.sceneSRV;
         }
     }
-    
-    // Check if sampling depth buffer
-    uint32_t dsSurf = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceDepthStencil);
-    if (dsSurf != 0 && dataAddr == X86_MEM_READ_u32(base, dsSurf + 4)) {
-        return g_d3d11.depthSRV;
-    }
-
 
     uint32_t xFmt = (fmtField >> X_D3DFORMAT_FORMAT_SHIFT) & 0xFF;
 
@@ -6261,19 +6823,49 @@ static ID3D11ShaderResourceView* GetOrCreateTextureSRV(uint8_t* base, uint32_t x
         auto itP = g_d3d11.guestRTByParent.find(xboxTexAddr);
         if (itP != g_d3d11.guestRTByParent.end() && itP->second && itP->second->srv)
             return itP->second->srv;
-        auto itD = g_d3d11.guestRTByDataAddr.find(dataAddr);
-        if (itD != g_d3d11.guestRTByDataAddr.end() && itD->second && itD->second->srv)
-            return itD->second->srv;
+        auto itD = g_d3d11.guestRTByDataAddr.find(dataAddr & 0x0FFFFFFF);
+        if (itD != g_d3d11.guestRTByDataAddr.end() && itD->second.rt) {
+            if (itD->second.mip == 0) {
+                return itD->second.rt->srv;
+            } else if (itD->second.mip < itD->second.rt->srvPerMip.size()) {
+                return itD->second.rt->srvPerMip[itD->second.mip];
+            }
+        }
     }
 
-    // Diagnostic: log fmtField bits 0..7 (below format code) once per
-    // unique texture header so we can spot the cube bit (0x04) if the
-    // game actually sets it.
-    {
-        static std::unordered_set<uint32_t> s_seenHdrs;
-        if (s_seenHdrs.insert(xboxTexAddr).second && s_seenHdrs.size() <= 64) {
-            fprintf(stderr, "[D3D11] tex hdr 0x%08X fmtField=0x%08X lowBits=0x%02X xFmt=0x%02X size=0x%08X\n",
-                    xboxTexAddr, fmtField, fmtField & 0xFFu, xFmt, sizeField);
+    // Xbox native VRAM addresses (0x08000000-0x0FFFFFFF) may contain GPU-managed
+    // framebuffer regions (bloom source, motion-blur capture, etc.) that the D3D11
+    // renderer never writes to directly.  However the same range also holds regular
+    // game textures loaded from disk AND small lookup/palette textures whose pixel
+    // data is legitimately all-zero.  Distinguish framebuffer captures by:
+    //   1. Probing guest memory — NV2A captures are never written so they stay zero.
+    //   2. Requiring a minimum texture size (>= 64x64) — small lookup tables must
+    //      NOT be redirected to prevSceneSRV because that would feed random scene
+    //      pixels into NV2A lighting/normal-map lookups and corrupt 3D shading.
+    if (dataAddr >= 0x08000000u && dataAddr < 0x10000000u) {
+        const uint32_t* probe = reinterpret_cast<const uint32_t*>(base + dataAddr);
+        bool hasData = false;
+        for (int k = 0; k < 16 && !hasData; ++k)
+            hasData = (probe[k] != 0u);
+        if (!hasData) {
+            // Decode dimensions quickly from the already-loaded fmtField/sizeField.
+            uint32_t vW, vH;
+            if (sizeField != 0) {
+                vW = (sizeField & X_D3DSIZE_WIDTH_MASK) + 1;
+                vH = ((sizeField & X_D3DSIZE_HEIGHT_MASK) >> X_D3DSIZE_HEIGHT_SHIFT) + 1;
+            } else {
+                vW = 1u << ((fmtField >> X_D3DFORMAT_USIZE_SHIFT) & 0xF);
+                vH = 1u << ((fmtField >> X_D3DFORMAT_VSIZE_SHIFT) & 0xF);
+            }
+            static int s_vramLog = 0;
+            if (s_vramLog < 16) {
+                fprintf(stderr, "[D3D11] VRAM-range tex hdr=0x%08X data=0x%08X (zero) %ux%u -> %s\n",
+                        xboxTexAddr, dataAddr, vW, vH,
+                        (vW >= 64 && vH >= 64) ? "sceneSRV" : "skip(too small)");
+                ++s_vramLog;
+            }
+            if (vW >= 64 && vH >= 64)
+                return g_d3d11.sceneSRV; // Use current-frame scene; prevSceneSRV causes bloom feedback loop
         }
     }
 
@@ -6331,43 +6923,7 @@ static ID3D11ShaderResourceView* GetOrCreateTextureSRV(uint8_t* base, uint32_t x
     case X_D3DFMT_DXT3:
         dxgiFmt = DXGI_FORMAT_BC2_UNORM; nativeDXT = true; break;
     case X_D3DFMT_DXT5:
-        dxgiFmt = DXGI_FORMAT_BC3_UNORM; nativeDXT = true;
-        // Diagnostic: report alpha-block bytes of the first DXT5 block, so
-        // we can see whether the env-map texture has real alpha or all-zero
-        // (which would explain the missing reflection blend).
-        {
-            static int s_dxt5Log = 0;
-            static std::unordered_set<uint32_t> s_dxt5Seen;
-            const bool isFirst = s_dxt5Seen.insert(xboxTexAddr).second;
-            if (isFirst && (s_dxt5Log < 64)) {
-                const uint8_t* p = base + dataAddr;
-                // Sample alpha indices across whole texture to detect
-                // "all alpha = 0" maps (the env-map smoking gun).
-                uint32_t numBlocks = ((texW + 3) / 4) * ((texH + 3) / 4);
-                uint32_t nzAlphaBlocks = 0;
-                uint32_t maxA0 = 0, maxA1 = 0;
-                for (uint32_t b = 0; b < numBlocks; ++b) {
-                    const uint8_t* bp = p + b * 16;
-                    uint8_t a0 = bp[0], a1 = bp[1];
-                    if (a0 > maxA0) maxA0 = a0;
-                    if (a1 > maxA1) maxA1 = a1;
-                    // Non-trivial alpha: either endpoint > 1, or any
-                    // non-zero alpha index byte.
-                    if (a0 > 1 || a1 > 1 || bp[2] || bp[3] || bp[4] || bp[5] || bp[6] || bp[7])
-                        ++nzAlphaBlocks;
-                }
-                fprintf(stderr, "[D3D11] DXT5 hdr=0x%08X data=0x%08X %ux%u "
-                                "alphaBlk0=[%02X %02X %02X %02X %02X %02X %02X %02X] "
-                                "rgbBlk0=[%02X %02X %02X %02X %02X %02X %02X %02X] "
-                                "nzAlphaBlks=%u/%u maxA0=%u maxA1=%u\n",
-                        xboxTexAddr, dataAddr, texW, texH,
-                        p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
-                        p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15],
-                        nzAlphaBlocks, numBlocks, maxA0, maxA1);
-                ++s_dxt5Log;
-            }
-        }
-        break;
+        dxgiFmt = DXGI_FORMAT_BC3_UNORM; nativeDXT = true; break;
     case 0x00: case 0x01: case 0x19:   // L8, AL8, A8
         dxgiFmt = DXGI_FORMAT_B8G8R8A8_UNORM; isAlphaOnly = true; break;
     default:
@@ -6515,6 +7071,15 @@ static ID3D11ShaderResourceView* GetOrCreateTextureSRV(uint8_t* base, uint32_t x
         }
     };
 
+    // Guard: ensure the texture data fits within guest RAM before copying.
+    if ((uint64_t)dataAddr + (uint64_t)numFaces * srcFaceBytes > X86_RAM_SIZE) {
+        static int s_oobLog = 0;
+        if (s_oobLog < 8)
+            fprintf(stderr, "[D3D11] tex data OOB: addr=0x%08X faces=%u faceBytes=0x%X\n",
+                    dataAddr, numFaces, srcFaceBytes);
+        ++s_oobLog;
+        return nullptr;
+    }
     for (uint32_t f = 0; f < numFaces; ++f) {
         buildFace(dataAddr + f * srcFaceBytes, faceBufs[f]);
     }
@@ -6566,33 +7131,64 @@ static ID3D11ShaderResourceView* GetOrCreateTextureSRV(uint8_t* base, uint32_t x
     ent.xboxFmtCode  = static_cast<uint8_t>(xFmt);
     ent.isAlphaOnly  = isAlphaOnly;
 
-    // Diagnostic: sample a few pixels from the uploaded buffer so we can tell
-    // if the Xbox texture data is actually populated (vs still zero from
-    // CreateTexture2) and whether our format decode produced meaningful data.
-    {
-        static int s_upDiag = 0;
-        if (s_upDiag < 24) {
-            uint32_t p0 = 0, pm = 0, pe = 0;
-            size_t bsz = buf.size();
-            if (bsz >= 4) {
-                p0 = *reinterpret_cast<uint32_t*>(buf.data());
-                pm = *reinterpret_cast<uint32_t*>(buf.data() + (bsz / 2 & ~3u));
-                pe = *reinterpret_cast<uint32_t*>(buf.data() + bsz - 4);
-            }
-            // Count how many of the first 256 4-byte words are non-zero.
-            int nz = 0, samples = (int)std::min<size_t>(256, bsz / 4);
-            for (int i = 0; i < samples; ++i)
-                if (reinterpret_cast<uint32_t*>(buf.data())[i] != 0) ++nz;
-            fprintf(stderr,
-                "[TEXUP] tex=0x%08X data=0x%08X %ux%u xFmt=0x%02X dxgi=%d sw=%d bytes=%zu "
-                "p0=0x%08X pm=0x%08X pe=0x%08X nz=%d/%d\n",
-                xboxTexAddr, dataAddr, texW, texH, xFmt, (int)dxgiFmt,
-                swizzled ? 1 : 0, bsz, p0, pm, pe, nz, samples);
-            ++s_upDiag;
-        }
-    }
-
     return pSRV;
+}
+
+static ID3D11ShaderResourceView* ResolveShaderResourceView(uint8_t* base, uint32_t stage, uint32_t snapshotAddr = 0, bool* outAlphaOnly = nullptr, uint32_t* outTexAddr = nullptr, uint32_t* outW = nullptr, uint32_t* outH = nullptr) {
+    if (stage >= 4) return nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    bool alphaOnly = false;
+    uint32_t texW = 1, texH = 1;
+    // If an explicit address is supplied by the caller (e.g. stage-aware snap/live
+    // selection in BindTranslatedPSFor2D), use it directly.  Otherwise fall back to
+    // the live texture register, which is correct for ordinary draw calls.
+    uint32_t texAddr = snapshotAddr ? snapshotAddr
+                                    : X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + stage * 4);
+    
+    auto tryHLE = [&]() -> ID3D11ShaderResourceView* {
+        if (texAddr) {
+            ID3D11ShaderResourceView* s = GetOrCreateTextureSRV(base, texAddr);
+            if (s) {
+                auto it = g_d3d11.textureCache.find(texAddr);
+                if (it != g_d3d11.textureCache.end()) {
+                    alphaOnly = it->second.isAlphaOnly;
+                    texW = it->second.width;
+                    texH = it->second.height;
+                }
+                return s;
+            }
+        }
+        return nullptr;
+    };
+    
+    auto tryNV2A = [&]() -> ID3D11ShaderResourceView* {
+        ID3D11ShaderResourceView* s = ResolveNV2ATextureSRV(base, stage);
+        if (s) {
+            const NV2ATextureState& st = g_nv2aTexture[stage];
+            if (st.imageRect != 0) {
+                texW = (st.imageRect >> 16) & 0xFFFF;
+                texH = (st.imageRect >>  0) & 0xFFFF;
+            }
+        }
+        return s;
+    };
+    
+    if (g_texBoundSource[stage] == 1 && snapshotAddr == 0) { // NV2A, no explicit override
+        srv = tryNV2A();
+        if (!srv) srv = tryHLE();
+    } else {
+        srv = tryHLE();
+        if (!srv) srv = tryNV2A();
+    }
+    
+    if (texW == 0) texW = 1;
+    if (texH == 0) texH = 1;
+    
+    if (outAlphaOnly) *outAlphaOnly = alphaOnly;
+    if (outTexAddr) *outTexAddr = texAddr;
+    if (outW) *outW = texW;
+    if (outH) *outH = texH;
+    return srv;
 }
 
 // ============================================================================
@@ -6605,6 +7201,8 @@ static void ReleaseBackBufferResources()
     R(g_d3d11.backBufferRTV);
     R(g_d3d11.backBufferTex);
     R(g_d3d11.sceneSRV);
+    R(g_d3d11.prevSceneSRV);
+    R(g_d3d11.prevSceneTex);
     R(g_d3d11.swapChainRTV);
     R(g_d3d11.swapChainTex);
     R(g_d3d11.depthDSV);
@@ -6654,6 +7252,13 @@ static void CreateBackBufferResources()
                                                     &g_d3d11.sceneSRV);
     if (FAILED(hr)) { fprintf(stderr, "[D3D11] CreateSRV(scene) failed: 0x%08X\n", hr); return; }
     SetD3DName(g_d3d11.sceneSRV, "B3_SceneSRV");
+
+    hr = g_d3d11.device->CreateTexture2D(&sd, nullptr, &g_d3d11.prevSceneTex);
+    if (SUCCEEDED(hr)) {
+        SetD3DName(g_d3d11.prevSceneTex, "B3_PrevSceneTex");
+        g_d3d11.device->CreateShaderResourceView(g_d3d11.prevSceneTex, nullptr, &g_d3d11.prevSceneSRV);
+        SetD3DName(g_d3d11.prevSceneSRV, "B3_PrevSceneSRV");
+    }
 
     // Depth target: TYPELESS so we can have both a DSV (D24_UNORM_S8_UINT) and
     // an SRV (R24_UNORM_X8_TYPELESS) for sampling depth in shaders.
@@ -6734,6 +7339,33 @@ static void InitRenderingPipeline()
     vsBlob->Release();
     if (FAILED(hr)) { fprintf(stderr, "[D3D11] CreateInputLayout failed\n"); return; }
     SetD3DName(g_d3d11.il2D, "B3_IL_2D");
+
+    // Extended VS + IL: 4 independent UV channels for multi-sample post-FX blur draws
+    {
+        ID3DBlob* vsExBlob = D3D11CompileShader(s_vsExHlsl, "main", "vs_4_0");
+        if (vsExBlob) {
+            g_d3d11.device->CreateVertexShader(vsExBlob->GetBufferPointer(),
+                                               vsExBlob->GetBufferSize(),
+                                               nullptr, &g_d3d11.vs2DEx);
+            SetD3DName(g_d3d11.vs2DEx, "B3_VS_2D_Ex");
+
+            // Vtx2DEx: pos(2f) + uv0(2f) + uv1(2f) + uv2(2f) + uv3(2f) + color(B8G8R8A8)
+            // Offsets:   0         8         16        24        32        40
+            D3D11_INPUT_ELEMENT_DESC iedEx[] = {
+                { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,   0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+                { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,   0,  8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+                { "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT,   0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+                { "TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT,   0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+                { "TEXCOORD", 3, DXGI_FORMAT_R32G32_FLOAT,   0, 32, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+                { "COLOR",    0, DXGI_FORMAT_B8G8R8A8_UNORM, 0, 40, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            };
+            g_d3d11.device->CreateInputLayout(iedEx, 6,
+                                              vsExBlob->GetBufferPointer(),
+                                              vsExBlob->GetBufferSize(), &g_d3d11.il2DEx);
+            SetD3DName(g_d3d11.il2DEx, "B3_IL_2D_Ex");
+            vsExBlob->Release();
+        }
+    }
 
     // Pixel shaders
     auto compPS = [&](const char* hlsl, ID3D11PixelShader** pp) {
@@ -6978,6 +7610,10 @@ static void HLE_InitD3D11(HWND hwnd, uint32_t w, uint32_t h)
     }
     fprintf(stderr, "[D3D11] Device created (FL %04X)\n", static_cast<unsigned>(fl));
 
+    // Acquire annotation interface for RenderDoc / PIX event markers.
+    g_d3d11.context->QueryInterface(__uuidof(ID3DUserDefinedAnnotation),
+        reinterpret_cast<void**>(&g_d3d11.annotation));
+
     CreateBackBufferResources();
     InitRenderingPipeline();
     g_d3d11.initialized = true;
@@ -7001,7 +7637,10 @@ static void HLE_ShutdownD3D11()
     }
     g_d3d11.rtCache.clear();
     auto R = [](auto*& p){ if (p) { p->Release(); p = nullptr; } };
+    if (g_d3d11.annotation) { g_d3d11.annotation->Release(); g_d3d11.annotation = nullptr; }
+    R(g_d3d11.scratchTex); R(g_d3d11.scratchSRV);
     R(g_d3d11.vs2D); R(g_d3d11.il2D);
+    R(g_d3d11.vs2DEx); R(g_d3d11.il2DEx);
     R(g_d3d11.psUntextured); R(g_d3d11.psAlpha); R(g_d3d11.psModulate);
     R(g_d3d11.cb2D); R(g_d3d11.dynamicVB); R(g_d3d11.dynamicIB);
     R(g_d3d11.bsAlpha); R(g_d3d11.bsOpaque); R(g_d3d11.rsNoCull); R(g_d3d11.dssOff);
@@ -7038,6 +7677,18 @@ void HLE_InvalidateTextureSRV(uint32_t texAddr)
 struct Vtx2D {
     float    x, y, u, v;
     uint32_t color; // ARGB in memory = BGRA_UNORM in D3D11
+};
+
+// Extended 2D vertex for translated-PS draws with 4 independent UV stages — 44 bytes.
+// Layout matches X_D3DFVF_XYZRHW|DIFFUSE|TEX4 after stripping z/rhw and extracting xy.
+struct Vtx2DEx {
+    float    x, y;        // screen-space position    (8)
+    float    u0, v0;      // UV for PS stage 0        (8)
+    float    u1, v1;      // UV for PS stage 1        (8)
+    float    u2, v2;      // UV for PS stage 2        (8)
+    float    u3, v3;      // UV for PS stage 3        (8)
+    uint32_t color;       // ARGB → BGRA_UNORM D3D11  (4)
+    // Total: 44 bytes
 };
 
 // Translate an NV097_SET_BLEND_FUNC factor (OpenGL-style enum written by
@@ -7248,6 +7899,31 @@ static void EnsureDynIB(uint32_t needed)
     g_d3d11.device->CreateBuffer(&d, nullptr, &g_d3d11.dynamicIB);
 }
 
+static void EnsureScratchTexture(uint32_t w, uint32_t h, DXGI_FORMAT fmt) {
+    if (g_d3d11.scratchTex && g_d3d11.scratchW == w && g_d3d11.scratchH == h && g_d3d11.scratchFmt == fmt)
+        return;
+    if (g_d3d11.scratchSRV) { g_d3d11.scratchSRV->Release(); g_d3d11.scratchSRV = nullptr; }
+    if (g_d3d11.scratchTex) { g_d3d11.scratchTex->Release(); g_d3d11.scratchTex = nullptr; }
+    
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    
+    if (SUCCEEDED(g_d3d11.device->CreateTexture2D(&td, nullptr, &g_d3d11.scratchTex))) {
+        g_d3d11.device->CreateShaderResourceView(g_d3d11.scratchTex, nullptr, &g_d3d11.scratchSRV);
+        g_d3d11.scratchW = w;
+        g_d3d11.scratchH = h;
+        g_d3d11.scratchFmt = fmt;
+        SetD3DName(g_d3d11.scratchTex, "B3_ScratchTex_InPlaceRT");
+    }
+}
+
 // Bind a translated programmable PS for use from the 2D batch path.
 // Uploads the live psC[0..15] from the RS shadow + final-combiner constants
 // (psC[16/17]) into cbPS, binds tps->ps, then resolves up to 4 texture
@@ -7272,7 +7948,9 @@ static bool BindTranslatedPSFor2D(uint8_t* base, TranslatedPS* tps)
         if (rs < kHLERenderStateCount) v = g_hleRenderStateCache[rs];
         if (v == 0) v = X86_MEM_READ_u32(base, kRSShadowBase + rs * 4);
         if (v == 0) v = X86_MEM_READ_u32(base, kRWPendingBase + rs * 4);
-        if (v != 0) {
+        
+        // Guard against clobbering constants cleanly set by SetPixelShaderConstant
+        if (v != 0 && !(g_pshConstantsDirty & (1u << i))) {
             g_pshConstants[i][0] = ((v >> 16) & 0xFF) / 255.0f;
             g_pshConstants[i][1] = ((v >>  8) & 0xFF) / 255.0f;
             g_pshConstants[i][2] = ((v >>  0) & 0xFF) / 255.0f;
@@ -7316,26 +7994,91 @@ static bool BindTranslatedPSFor2D(uint8_t* base, TranslatedPS* tps)
 
     ID3D11ShaderResourceView* srvs[4]  = {};
     ID3D11SamplerState*       samps[4] = {};
+
     for (unsigned s = 0; s < 4; ++s) {
+        ID3D11ShaderResourceView* stageSrv = nullptr;
         if (tps->usesStage[s]) {
-            uint32_t addr = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + s * 4);
-            // Prefer NV2A hardware push buffer if recently updated.
-            if (g_nv2aTexture[s].dirty) {
-                srvs[s] = ResolveNV2ATextureSRV(base, s);
-            } else if (addr) {
-                srvs[s] = GetOrCreateTextureSRV(base, addr);
-            } else {
-                srvs[s] = ResolveNV2ATextureSRV(base, s);
-            }
-            
-            if (!srvs[s] && g_psTexHandleSnapshot[s]) {
-                srvs[s] = GetOrCreateTextureSRV(base, g_psTexHandleSnapshot[s]);
+            // The game sets ALL texture stages to the primary texture just before
+            // the draw (clobbering stages 1+). Stage 0 live is correct (primary
+            // texture); stages 1+ must come from the snapshot captured at
+            // SetPixelShader time (where secondary textures were still correct).
+            uint32_t liveAddr = base ? X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + s * 4) : 0;
+            uint32_t addr;
+            if (s == 0)
+                addr = liveAddr ? liveAddr : g_psTexHandleSnapshot[0];
+            else
+                addr = g_psTexHandleSnapshot[s] ? g_psTexHandleSnapshot[s] : liveAddr;
+            stageSrv = ResolveShaderResourceView(base, s, addr);
+        }
+        srvs[s]  = stageSrv;
+        // Bloom chain downsampling passes use UV coordinates that exceed [0,1] and
+        // expect CLAMP semantics (the Xbox NV2A sampler is set to CLAMP for these stages).
+        // All other translated PSes keep WRAP.
+        samps[s] = (g_currentPSHandle == 0x008FC000u ||
+                    g_currentPSHandle == 0x008FD000u ||
+                    g_currentPSHandle == 0x008FE000u ||
+                    g_currentPSHandle == 0x008FF000u)
+                   ? g_d3d11.samplerLinear
+                   : g_d3d11.samplerWrap;
+    }
+
+    if (g_d3d11.activeGuestRT) {
+        GuestRT* art = g_d3d11.activeGuestRT;
+        uint32_t aMip = g_d3d11.activeGuestRTMip;
+        ID3D11ShaderResourceView* sub = (aMip < art->srvSrcExclMip.size()) ? art->srvSrcExclMip[aMip] : nullptr;
+        for (unsigned s = 0; s < 4; ++s) {
+            if (srvs[s] == art->srv) {
+                if (sub) {
+                    srvs[s] = sub;
+                } else {
+                    // aMip==0: srvSrcExclMip[0] is always null (no lower mips to exclude).
+                    // Copy mip 0 of this GuestRT to scratch so the blur shader reads what
+                    // the previous pass (e.g. radial blur) just rendered into this surface.
+                    EnsureScratchTexture(art->baseW, art->baseH, art->dxgiFormat);
+                    if (g_d3d11.scratchTex) {
+                        g_d3d11.context->CopySubresourceRegion(
+                            g_d3d11.scratchTex, 0, 0, 0, 0,
+                            art->texture, 0, nullptr);
+                        srvs[s] = g_d3d11.scratchSRV;
+                    } else {
+                        srvs[s] = nullptr;
+                    }
+                }
+            } else if (aMip < art->srvPerMip.size() && srvs[s] == art->srvPerMip[aMip]) {
+                // Exact-overlap prevention for Blur passes sampling Mip X and writing Mip X 
+                uint32_t mw = std::max<uint32_t>(1, art->baseW >> aMip);
+                uint32_t mh = std::max<uint32_t>(1, art->baseH >> aMip);
+                EnsureScratchTexture(mw, mh, art->dxgiFormat);
+                if (g_d3d11.scratchTex) {
+                    g_d3d11.context->CopySubresourceRegion(
+                        g_d3d11.scratchTex, 0, 0, 0, 0,
+                        art->texture, aMip, nullptr);
+                    srvs[s] = g_d3d11.scratchSRV;
+                } else {
+                    srvs[s] = nullptr;
+                }
             }
         }
-        samps[s] = g_d3d11.samplerWrap;
+    } else {
+        // Active RT is the Back Buffer
+        for (unsigned s = 0; s < 4; ++s) {
+            if (srvs[s] == g_d3d11.sceneSRV) {
+                EnsureScratchTexture(g_d3d11.width, g_d3d11.height, g_d3d11.sceneFormat);
+                if (g_d3d11.scratchTex) {
+                    g_d3d11.context->CopySubresourceRegion(
+                        g_d3d11.scratchTex, 0, 0, 0, 0,
+                        g_d3d11.backBufferTex, 0, nullptr);
+                    srvs[s] = g_d3d11.scratchSRV;
+                } else {
+                    srvs[s] = nullptr;
+                }
+            }
+        }
     }
+
     SC_PSSRVs(4, srvs);
     SC_PSSamplers(4, samps);
+
     return true;
 }
 
@@ -7349,113 +8092,241 @@ static const char* g_b2dCallerTag = "?";
 // pointers from kDeviceAddr+0x0B00..0x0B0C without changing the signature
 // of HLE_DrawBatch2D. nullptr disables the translated-PS fallback.
 static uint8_t* g_b2dBase = nullptr;
+
 static void HLE_DrawBatch2D(const Vtx2D*              verts,
                              uint32_t                  nverts,
                              D3D_PRIMITIVE_TOPOLOGY    topo,
                              ID3D11ShaderResourceView* srv,
                              bool                      isAlphaOnly,
-                             bool                      useRHW = false)
+                             const Vtx2DEx*            exVerts  = nullptr,
+                             uint32_t                  nexVerts = 0)
 {
     if (!g_d3d11.initialized || !g_d3d11.pipelineReady || nverts == 0) return;
-    if (PpDebug()) ++g_ppDrawsSinceRT;
-    {
-        static int s_b2dProbe = 0;
-        float minX=1e9f,minY=1e9f,maxX=-1e9f,maxY=-1e9f;
-        for (uint32_t i=0;i<nverts;++i){
-            if (verts[i].x<minX) minX=verts[i].x;
-            if (verts[i].y<minY) minY=verts[i].y;
-            if (verts[i].x>maxX) maxX=verts[i].x;
-            if (verts[i].y>maxY) maxY=verts[i].y;
-        }
-        const float W = (float)g_d3d11.width;
-        const float H = (float)g_d3d11.height;
-        const float w = maxX - minX, h = maxY - minY;
-        const bool isFullscreen = (w >= 0.75f * W) && (h >= 0.75f * H);
-        const uint32_t c0 = verts[0].color;
-        const uint8_t cr = (c0>>16)&0xFF, cg = (c0>>8)&0xFF, cb = c0&0xFF;
-        const bool isWhitish = (cr>=0xE0 && cg>=0xE0 && cb>=0xE0);
-        const bool suspect = isFullscreen || (isWhitish && !srv) || (!srv && w >= 0.5f*W && h >= 0.5f*H);
-        //if (s_b2dProbe < 200 || suspect) {
-        //    fprintf(stderr,
-        //        "[B2D]%s #%d src=%s nverts=%u srv=%p alphaOnly=%d topo=%d color0=0x%08X "
-        //        "rect=(%.1f,%.1f)-(%.1f,%.1f) psh=0x%08X\n",
-        //        suspect?"!":"", s_b2dProbe, g_b2dCallerTag,
-        //        nverts, (void*)srv, isAlphaOnly?1:0, (int)topo,
-        //        c0, minX, minY, maxX, maxY, g_currentPSHandle);
-        //    ++s_b2dProbe;
-        //}
+
+    // Decide whether to use the extended (multi-UV) vertex path.
+    // Only used when a translated PS is active AND valid extended vertices are provided.
+    TranslatedPS* tpsCheck = nullptr;
+    if (g_currentPSHandle && g_b2dBase) {
+        auto it = g_psByHandle.find(g_currentPSHandle);
+        if (it != g_psByHandle.end() && it->second.ps) tpsCheck = &it->second;
     }
+    const bool useExPath = (exVerts != nullptr && nexVerts > 0 &&
+                            tpsCheck != nullptr &&
+                            g_d3d11.vs2DEx && g_d3d11.il2DEx);
+    const uint32_t drawVerts  = useExPath ? nexVerts : nverts;
+    const uint32_t vbNeeded   = useExPath
+                                    ? nexVerts * (uint32_t)sizeof(Vtx2DEx)
+                                    : nverts   * (uint32_t)sizeof(Vtx2D);
 
-    // The original guest pixel shader sources its colour from a texture
-    // that we couldn't bind (programmable PS / unhooked NV2A texture path).
-    // Without it our psUntextured path falls back to vertex.color, which
-    // for these draws is something like 0x00FFFFFF (alpha-zero white) —
-    // interpreted by D3D11 BGRA UNORM as solid opaque white when blending
-    // is disabled, giving the white rectangles seen in RenderDoc.
-    // ColorOpUsesTexture() returns true whenever the active combiner
-    // op references TEXTURE on either arg (MODULATE/SELECTARGn/etc.).
-    // Drop the draw rather than render an obvious artifact.
-    // if (!srv && ColorOpUsesTexture()) {
-    //     static int s_skipped = 0;
-    //     if (s_skipped++ < 32) {
-    //         fprintf(stderr,
-    //             "[PP] DrawBatch2D SKIP textured combiner w/o SRV "
-    //             "nverts=%u op=%u arg1=%u arg2=%u color=0x%08X pos=(%.1f,%.1f)\n",
-    //             nverts, g_colorOp, g_colorArg1, g_colorArg2, verts[0].color,
-    //             verts[0].x, verts[0].y);
-    //     }
-    //     return;
-    // }
-
-    uint32_t vbNeeded = nverts * sizeof(Vtx2D);
     EnsureDynVB(vbNeeded);
     if (!g_d3d11.dynamicVB) return;
 
-    // Upload vertices
+    // Upload vertices (extended or standard path)
     D3D11_MAPPED_SUBRESOURCE mr = {};
     if (FAILED(g_d3d11.context->Map(g_d3d11.dynamicVB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr)))
         return;
-    memcpy(mr.pData, verts, vbNeeded);
+    if (useExPath)
+        memcpy(mr.pData, exVerts, nexVerts * sizeof(Vtx2DEx));
+    else
+        memcpy(mr.pData, verts, nverts * sizeof(Vtx2D));
     g_d3d11.context->Unmap(g_d3d11.dynamicVB, 0);
 
-    // Update constant buffer with current screen size
-    if (SUCCEEDED(g_d3d11.context->Map(g_d3d11.cb2D, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr))) {
-        float* cb = static_cast<float*>(mr.pData);
-        cb[0] = static_cast<float>(g_d3d11.width);
-        cb[1] = static_cast<float>(g_d3d11.height);
-        cb[2] = 0.0f; cb[3] = 0.0f;
-        g_d3d11.context->Unmap(g_d3d11.cb2D, 0);
+    uint32_t vpX = (g_b2dBase ? X86_MEM_READ_u32(g_b2dBase, kDeviceAddr + kDeviceViewport + 0) : 0);
+    uint32_t vpY = (g_b2dBase ? X86_MEM_READ_u32(g_b2dBase, kDeviceAddr + kDeviceViewport + 4) : 0);
+    uint32_t vpW = (g_b2dBase ? X86_MEM_READ_u32(g_b2dBase, kDeviceAddr + kDeviceViewport + 8) : 0);
+    uint32_t vpH = (g_b2dBase ? X86_MEM_READ_u32(g_b2dBase, kDeviceAddr + kDeviceViewport + 12) : 0);
+
+    if (vpW == 0) vpW = g_d3d11.width;
+    if (vpH == 0) vpH = g_d3d11.height;
+
+    uint32_t guestVpX = vpX, guestVpY = vpY, guestVpW = vpW, guestVpH = vpH;
+    // When the guest viewport is unset (all zeros), infer dimensions from
+    // the active guest render target so the D3D11 RSSetViewports call covers
+    // the full RT area.  The CB2D transform is computed separately from vertex
+    // data in the CB2D update block below.
+    if (guestVpW == 0 && guestVpH == 0 && g_d3d11.activeGuestRT) {
+        guestVpW = g_d3d11.activeGuestRT->baseW;
+        guestVpH = g_d3d11.activeGuestRT->baseH;
+        guestVpX = 0;
+        guestVpY = 0;
     }
 
-    // Render target: respect D3DDevice_SetRenderTarget so post-FX draws
-    // land on the correct off-screen RT instead of always the back buffer.
     {
         uint32_t surfAddr = g_d3d11.currentRTSurf;
         if (surfAddr == 0)
             surfAddr = (g_b2dBase ? X86_MEM_READ_u32(g_b2dBase, kDeviceAddr + kDeviceRenderTarget) : 0);
         bool boundGuestRT = false;
         if (surfAddr != 0) {
+            GuestRT* rt = nullptr;
+            uint32_t mip = 0;
+            
             auto it = g_d3d11.guestRTBySurface.find(surfAddr);
             if (it != g_d3d11.guestRTBySurface.end()) {
-                GuestRT* rt = it->second.rt;
+                rt = it->second.rt;
                 uint32_t pParent = g_b2dBase ? X86_MEM_READ_u32(g_b2dBase, surfAddr + 0x14) : 0;
                 if (!rt && pParent && g_b2dBase) {
                     rt = EnsureGuestRT(g_b2dBase, pParent);
                     if (rt) it->second.rt = rt;
                 }
-                uint32_t mip = it->second.mip;
-                if (rt && mip < rt->rtvPerMip.size() && rt->rtvPerMip[mip]) {
-                    ID3D11ShaderResourceView* nullSRVs[4] = {};
-                    SC_PSSRVs(4, nullSRVs);
-                    g_d3d11.context->OMSetRenderTargets(1, &rt->rtvPerMip[mip], nullptr);
-                    g_d3d11.activeGuestRT    = rt;
-                    g_d3d11.activeGuestRTMip = mip;
-                    boundGuestRT = true;
+                if (rt && g_b2dBase) {
+                    mip = GetMipFromSurface(g_b2dBase, surfAddr, rt);
+                    it->second.mip = mip;
+                }
+            } else if (g_b2dBase) {
+                uint32_t pParent = X86_MEM_READ_u32(g_b2dBase, surfAddr + 0x14);
+                if (pParent != 0) {
+                    rt = EnsureGuestRT(g_b2dBase, pParent);
+                }
+                // Fallback: treat surfAddr itself as the texture header.
+                // Burnout 3's bloom pass calls SetRenderTarget with texture
+                // object addresses directly (0x4D6A18, 0x4D6A30, 0x4D6A48)
+                // rather than GetSurfaceLevel surfaces, so pParent is 0 or
+                // garbage.  Only try this for game-side addresses (below the
+                // ContigAlloc region at 0x19000000); back-buffer surfaces from
+                // CreateDevice live at 0x19000000+ and must NOT be treated as
+                // texture headers.
+                if (!rt && surfAddr < 0x19000000u) {
+                    static int s_fbLog = 0;
+                    if (s_fbLog < 16) {
+                        uint32_t fb_fmt  = X86_MEM_READ_u32(g_b2dBase, surfAddr + 12);
+                        uint32_t fb_size = X86_MEM_READ_u32(g_b2dBase, surfAddr + 16);
+                        uint32_t fb_data = X86_MEM_READ_u32(g_b2dBase, surfAddr + 4);
+                        fprintf(stderr, "[D3D11] RT-self-hdr fallback surfAddr=0x%08X pParent=0x%08X data=0x%08X fmt=0x%08X size=0x%08X\n",
+                                surfAddr, pParent, fb_data, fb_fmt, fb_size);
+                        ++s_fbLog;
+                    }
+                    rt = EnsureGuestRT(g_b2dBase, surfAddr);
+                }
+                if (rt) {
+                    mip = GetMipFromSurface(g_b2dBase, surfAddr, rt);
+                    SurfaceRTBind b;
+                    b.rt = rt;
+                    b.mip = mip;
+                    b.parent = pParent;
+                    g_d3d11.guestRTBySurface[surfAddr] = b;
                 }
             }
+
+            if (rt && mip < rt->rtvPerMip.size() && rt->rtvPerMip[mip]) {
+                ID3D11ShaderResourceView* nullSRVs[4] = {};
+                SC_PSSRVs(4, nullSRVs);
+                g_d3d11.context->OMSetRenderTargets(1, &rt->rtvPerMip[mip], nullptr);
+                g_d3d11.activeGuestRT    = rt;
+                g_d3d11.activeGuestRTMip = mip;
+                boundGuestRT = true;
+                
+                // Allow guest viewport settings to map 1:1 with NDC dimensions organically.
+            }
         }
-        if (!boundGuestRT)
+        if (!boundGuestRT) {
             g_d3d11.context->OMSetRenderTargets(1, &g_d3d11.backBufferRTV, nullptr);
+            g_d3d11.activeGuestRT = nullptr;
+            g_d3d11.activeGuestRTMip = 0;
+        }
+    }
+
+    // Rasterizer + viewport
+    SC_Raster(g_d3d11.rsNoCull);
+    {
+        // D3D11 viewport must cover the full RT with positive dimensions.
+        // Use the actual RT size when the guest viewport is unset.
+        float rtW = (vpW > 0) ? static_cast<float>(vpW) : static_cast<float>(g_d3d11.width);
+        float rtH = (vpH > 0) ? static_cast<float>(vpH) : static_cast<float>(g_d3d11.height);
+        if (g_d3d11.activeGuestRT) {
+            rtW = static_cast<float>(g_d3d11.activeGuestRT->baseW);
+            rtH = static_cast<float>(g_d3d11.activeGuestRT->baseH);
+        }
+        D3D11_VIEWPORT vp11 = {};
+        vp11.Width    = rtW;
+        vp11.Height   = rtH;
+        vp11.TopLeftX = static_cast<float>(vpX);
+        // For ExPath draws (post-FX composites), expand symmetric Xbox letterbox
+        // viewports to full screen.  The CB2D transform is derived from vertex data
+        // (not the viewport), so the NDC range is already correct — expanding the
+        // D3D11 viewport just maps that NDC range to the full screen instead of the
+        // letterbox content rows.  Non-ExPath 2D draws keep the original viewport
+        // because their CB2D IS derived from the viewport.
+        if (useExPath && vpY > 0 && vpH + 2u * vpY == g_bbHeight)
+            vp11.TopLeftY = 0.0f;
+        else
+            vp11.TopLeftY = static_cast<float>(vpY);
+        vp11.MaxDepth = 1.0f;
+        g_d3d11.context->RSSetViewports(1, &vp11);
+    }
+
+    // Update constant buffer with current screen size Using Guest's intended window space (not physical RT space)
+    mr = {};
+    if (SUCCEEDED(g_d3d11.context->Map(g_d3d11.cb2D, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr))) {
+        float cbSizeX = static_cast<float>(guestVpW);
+        float cbSizeY = static_cast<float>(guestVpH);
+        float cbOffX  = static_cast<float>(guestVpX);
+        float cbOffY  = static_cast<float>(guestVpY);
+
+        // For ExPath draws (post-FX stride=52 quads), derive the correct Y
+        // transform directly from the vertex positions. The Xbox NV2A may use a
+        // non-standard viewport (e.g. centered Y where +Y=top) that doesn't
+        // match our "screen-space from top-left" assumption.
+        // Rule: if any vertex Y < 0, the coordinate system is center-origin
+        // (max_y is screen-top → ndc=+1, min_y is screen-bottom → ndc=-1),
+        // so we use off=max_y, size=min_y-max_y (negative, flipping the VS).
+        // Otherwise it's normal screen-space: off=min_y, size=max_y-min_y.
+        if (useExPath && nexVerts > 0 && exVerts != nullptr) {
+            float minY = exVerts[0].y, maxY = exVerts[0].y;
+            float minX = exVerts[0].x, maxX = exVerts[0].x;
+            for (uint32_t vi = 1; vi < nexVerts; ++vi) {
+                if (exVerts[vi].y < minY) minY = exVerts[vi].y;
+                if (exVerts[vi].y > maxY) maxY = exVerts[vi].y;
+                if (exVerts[vi].x < minX) minX = exVerts[vi].x;
+                if (exVerts[vi].x > maxX) maxX = exVerts[vi].x;
+            }
+            // PS=0x00901000 is the blur composite drawn in centered coordinates
+            // (+Y = up, 0 = screen centre).  The game may emit the composite as
+            // a single quad (Y = +barH → -barH) or split into two half-quads
+            // (Y = +barH → 0  and  Y = 0 → -barH).
+            // For PS 0x00901000 (blur composite) we apply a fixed full-screen
+            // mapping (not the Xbox letterbox-area mapping) so the composite
+            // fills the entire screen.  The condition also catches split
+            // half-quads (top: minY=0 maxY>0, bottom: minY<0 maxY=0).
+            if (g_currentPSHandle == 0x00901000u &&
+                (minY < 0.0f || maxY > 0.0f)) {
+                // Centred composite (PS 0x00901000).  The game uses Y = ±barH
+                // in centred coords (±Y = up/down from screen centre).  Map
+                // the full ±barH range to the full screen so the composite
+                // fills edge-to-edge, removing the Xbox letterbox bars.
+                //
+                // For any sub-quad layout (single ±barH, or split top/bottom):
+                //   cbOffY  = barH       (Y = +barH → NDC = +1, screen top)
+                //   cbSizeY = -2 * barH  (Y = -barH → NDC = -1, screen bottom)
+                //
+                // barH is derived from the vertex data so this is robust to
+                // any bar height the game uses.
+                const float barH = std::max(maxY, -minY);
+                cbOffY  = barH;
+                cbSizeY = -2.0f * barH;
+                cbOffX  = minX;
+                cbSizeX = maxX - minX;
+            } else if (minY < 0.0f) {
+                // Other centred/inverted draw (e.g. PS=0x00900000 blur accum):
+                // max_y = top of screen.
+                cbOffX  = minX;
+                cbSizeX = maxX - minX;
+                cbOffY  = maxY;
+                cbSizeY = minY - maxY; // negative → flips VS Y direction
+            } else {
+                // Normal screen-space: min_y = top of screen.
+                cbOffY  = minY;
+                cbSizeY = (maxY > minY) ? (maxY - minY) : cbSizeY;
+                cbOffX  = minX;
+                cbSizeX = (maxX > minX) ? (maxX - minX) : cbSizeX;
+            }
+        }
+
+        float* cb = static_cast<float*>(mr.pData);
+        cb[0] = cbSizeX;
+        cb[1] = cbSizeY;
+        cb[2] = cbOffX;
+        cb[3] = cbOffY;
+        g_d3d11.context->Unmap(g_d3d11.cb2D, 0);
     }
 
     // If a programmable PS is active (post-FX path) we'll bind that
@@ -7483,24 +8354,23 @@ static void HLE_DrawBatch2D(const Vtx2D*              verts,
     SC_BlendState(bs, bf, 0xFFFFFFFF);
     SC_DepthStencil(g_d3d11.dssOff, 0);
 
-    // Rasterizer + viewport
-    SC_Raster(g_d3d11.rsNoCull);
-    D3D11_VIEWPORT vp = {};
-    vp.Width    = static_cast<float>(g_d3d11.width);
-    vp.Height   = static_cast<float>(g_d3d11.height);
-    vp.MaxDepth = 1.0f;
-    g_d3d11.context->RSSetViewports(1, &vp);
+    //// Rasterizer + viewport
+    //SC_Raster(g_d3d11.rsNoCull);
+    //D3D11_VIEWPORT vp = {};
+    //vp.Width    = static_cast<float>(g_d3d11.width);
+    //vp.Height   = static_cast<float>(g_d3d11.height);
+    //vp.MaxDepth = 1.0f;
+    //g_d3d11.context->RSSetViewports(1, &vp);
 
     // Vertex shader + input layout + cbuffer
-    if (useRHW && g_d3d11.vs2D_RHW) {
-        SC_VS(g_d3d11.vs2D_RHW);
-        SC_VSCB0(g_d3d11.cb2D);
-        SC_IL(g_d3d11.il2D_RHW);
+    if (useExPath) {
+        SC_VS(g_d3d11.vs2DEx);
+        SC_IL(g_d3d11.il2DEx);
     } else {
         SC_VS(g_d3d11.vs2D);
-        SC_VSCB0(g_d3d11.cb2D);
         SC_IL(g_d3d11.il2D);
     }
+    SC_VSCB0(g_d3d11.cb2D);
 
     // Pixel shader selection.
     //
@@ -7523,19 +8393,62 @@ static void HLE_DrawBatch2D(const Vtx2D*              verts,
         SC_PS(ps);
 
         if (srv) {
+            // Hazard mitigation 
+            if (g_d3d11.activeGuestRT && srv == g_d3d11.activeGuestRT->srv) {
+                uint32_t aMip = g_d3d11.activeGuestRTMip;
+                if (aMip < g_d3d11.activeGuestRT->srvSrcExclMip.size())
+                    srv = g_d3d11.activeGuestRT->srvSrcExclMip[aMip];
+                else
+                    srv = nullptr;
+            } else if (g_d3d11.activeGuestRT && g_d3d11.activeGuestRTMip < g_d3d11.activeGuestRT->srvPerMip.size() && srv == g_d3d11.activeGuestRT->srvPerMip[g_d3d11.activeGuestRTMip]) {
+                GuestRT* art = g_d3d11.activeGuestRT;
+                uint32_t aMip = g_d3d11.activeGuestRTMip;
+                uint32_t mw = std::max<uint32_t>(1, art->baseW >> aMip);
+                uint32_t mh = std::max<uint32_t>(1, art->baseH >> aMip);
+                EnsureScratchTexture(mw, mh, art->dxgiFormat);
+                if (g_d3d11.scratchTex) {
+                    g_d3d11.context->CopySubresourceRegion(
+                        g_d3d11.scratchTex, 0, 0, 0, 0,
+                        art->texture, aMip, nullptr);
+                    srv = g_d3d11.scratchSRV;
+                } else {
+                    srv = nullptr;
+                }
+            } else if (!g_d3d11.activeGuestRT && srv == g_d3d11.sceneSRV) {
+                EnsureScratchTexture(g_d3d11.width, g_d3d11.height, g_d3d11.sceneFormat);
+                if (g_d3d11.scratchTex) {
+                    g_d3d11.context->CopySubresourceRegion(
+                        g_d3d11.scratchTex, 0, 0, 0, 0,
+                        g_d3d11.backBufferTex, 0, nullptr);
+                    srv = g_d3d11.scratchSRV;
+                } else {
+                    srv = nullptr;
+                }
+            }
+
             ID3D11ShaderResourceView* one[1]   = { srv };
             ID3D11SamplerState*       samp1[1] = { g_d3d11.samplerLinear };
             SC_PSSRVs(1, one);
-            // Use clamp sampler to avoid bleeding at texture-atlas borders.
             SC_PSSamplers(1, samp1);
         }
     }
 
     // Vertex buffer
-    UINT stride = sizeof(Vtx2D), offset = 0;
+    UINT stride = useExPath ? (UINT)sizeof(Vtx2DEx) : (UINT)sizeof(Vtx2D), offset = 0;
     SC_VB(g_d3d11.dynamicVB, stride, offset);
     SC_Topology(topo);
-    g_d3d11.context->Draw(nverts, 0);
+    // {
+    //     wchar_t _m[192];
+    //     const wchar_t* topoName = (topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)  ? L"TRILIST" :
+    //                               (topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) ? L"TRISTRIP" :
+    //                               (topo == D3D11_PRIMITIVE_TOPOLOGY_LINELIST)      ? L"LINELIST" : L"OTHER";
+    //     uint32_t tex0 = g_b2dBase ? X86_MEM_READ_u32(g_b2dBase, kDeviceAddr + 0x0B00) : 0;
+    //     swprintf(_m, 192, L"f=%u d=%u RT=%08X IM/%s %uv tex=%08X srv=%s",
+    //              g_ppFrame, g_drawCallCount, g_d3d11.currentRTSurf, topoName, drawVerts,
+    //              tex0, srv ? L"Y" : L"N");
+    //     RdocMark(_m);
+    // }
+    g_d3d11.context->Draw(drawVerts, 0);
 
     // Unbind SRV to avoid hazards on next frame
     if (boundTPS) {
@@ -7560,43 +8473,91 @@ static bool BindActiveRenderTarget(uint8_t* base, bool wantDepth)
     if (surfAddr == 0)
         surfAddr = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceRenderTarget);
 
+    // Read the Guest's explicitly requested viewport
+    uint32_t vpX = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 0);
+    uint32_t vpY = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 4);
+    uint32_t vpW = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 8);
+    uint32_t vpH = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 12);
+
     if (surfAddr != 0) {
+        GuestRT* rt = nullptr;
+        uint32_t mip = 0;
+        
         auto it = g_d3d11.guestRTBySurface.find(surfAddr);
         if (it != g_d3d11.guestRTBySurface.end()) {
+            rt = it->second.rt;
             uint32_t pParent = X86_MEM_READ_u32(base, surfAddr + 0x14);
-            GuestRT* rt = it->second.rt;
             if (!rt && pParent != 0) {
                 rt = EnsureGuestRT(base, pParent);
                 if (rt) it->second.rt = rt;
             }
-            uint32_t mip = it->second.mip;
-            if (rt && mip < rt->rtvPerMip.size() && rt->rtvPerMip[mip]) {
-                // Defensive: detach SRV from sampler stages so D3D11 doesn't
-                // complain about read/write hazard.
-                ID3D11ShaderResourceView* nullSRVs[4] = { nullptr, nullptr, nullptr, nullptr };
-                SC_PSSRVs(4, nullSRVs);
-                g_d3d11.context->OMSetRenderTargets(1, &rt->rtvPerMip[mip], nullptr);
-                g_d3d11.activeGuestRT    = rt;
-                g_d3d11.activeGuestRTMip = mip;
-                D3D11_VIEWPORT vp = {};
-                uint32_t mw = (rt->baseW >> mip) ? (rt->baseW >> mip) : 1u;
-                uint32_t mh = (rt->baseH >> mip) ? (rt->baseH >> mip) : 1u;
-                vp.Width    = static_cast<float>(mw);
-                vp.Height   = static_cast<float>(mh);
-                vp.MaxDepth = 1.0f;
-                g_d3d11.context->RSSetViewports(1, &vp);
-                return true;
+            if (rt) {
+                mip = GetMipFromSurface(base, surfAddr, rt);
+                it->second.mip = mip;
             }
+        } else {
+            uint32_t pParent = X86_MEM_READ_u32(base, surfAddr + 0x14);
+            if (pParent != 0) {
+                rt = EnsureGuestRT(base, pParent);
+                if (rt) {
+                    mip = GetMipFromSurface(base, surfAddr, rt);
+                    SurfaceRTBind b;
+                    b.rt = rt;
+                    b.mip = mip;
+                    b.parent = pParent;
+                    g_d3d11.guestRTBySurface[surfAddr] = b;
+                }
+            }
+        }
+
+        if (rt && mip < rt->rtvPerMip.size() && rt->rtvPerMip[mip]) {
+            if (PpDebug())
+                fprintf(stderr, "[PP] f=%u BindGuestRT surf=0x%08X mip=%u rtvSz=%u\n",
+                        g_ppFrame, surfAddr, mip, (unsigned)rt->rtvPerMip.size());
+            ID3D11ShaderResourceView* nullSRVs[4] = { nullptr, nullptr, nullptr, nullptr };
+            SC_PSSRVs(4, nullSRVs);
+            ID3D11DepthStencilView* guestDSV = (wantDepth && mip < rt->dsvPerMip.size())
+                                               ? rt->dsvPerMip[mip] : nullptr;
+            g_d3d11.context->OMSetRenderTargets(1, &rt->rtvPerMip[mip], guestDSV);
+            g_d3d11.activeGuestRT    = rt;
+            g_d3d11.activeGuestRTMip = mip;
+            
+            D3D11_VIEWPORT vp = {};
+            vp.Width    = vpW > 0 ? static_cast<float>(vpW) : static_cast<float>(g_d3d11.width);
+            // Expand symmetric Xbox letterbox viewport so the D3D11 rasterizer covers
+            // the full screen.  c[58]/c[59] (fed from device memory) keep the original
+            // Xbox values, so the VS epilogue maps scene vertices to NDC ±1 as expected.
+            // The expanded D3D11 viewport then maps NDC ±1 to rows 0..screenH.
+            // Guard: only expand when the RT is tall enough (e.g. the 640×480 scene RT,
+            // not small 128×128 reflection/shadow map RTs which would clip content).
+            if (vpY > 0 && vpH + 2u * vpY == g_bbHeight && rt->baseH >= g_bbHeight)
+                { vp.Height = static_cast<float>(g_bbHeight); vp.TopLeftY = 0.0f; }
+            else
+                { vp.Height = vpH > 0 ? static_cast<float>(vpH) : static_cast<float>(g_d3d11.height);
+                  vp.TopLeftY = static_cast<float>(vpY); }
+            vp.TopLeftX = static_cast<float>(vpX);
+            vp.MaxDepth = 1.0f;
+            g_d3d11.context->RSSetViewports(1, &vp);
+            return true;
         }
     }
 
+    if (PpDebug())
+        fprintf(stderr, "[PP] f=%u BindBackBuf surf=0x%08X\n",
+                g_ppFrame, surfAddr);
     g_d3d11.context->OMSetRenderTargets(1, &g_d3d11.backBufferRTV,
                                         wantDepth ? g_d3d11.depthDSV : nullptr);
     g_d3d11.activeGuestRT    = nullptr;
     g_d3d11.activeGuestRTMip = 0;
+
     D3D11_VIEWPORT vp = {};
-    vp.Width    = static_cast<float>(g_d3d11.width);
-    vp.Height   = static_cast<float>(g_d3d11.height);
+    vp.Width    = vpW > 0 ? static_cast<float>(vpW) : static_cast<float>(g_d3d11.width);
+    if (vpY > 0 && vpH + 2u * vpY == g_bbHeight)
+        { vp.Height = static_cast<float>(g_bbHeight); vp.TopLeftY = 0.0f; }
+    else
+        { vp.Height = vpH > 0 ? static_cast<float>(vpH) : static_cast<float>(g_d3d11.height);
+          vp.TopLeftY = static_cast<float>(vpY); }
+    vp.TopLeftX = static_cast<float>(vpX);
     vp.MaxDepth = 1.0f;
     g_d3d11.context->RSSetViewports(1, &vp);
     return false;
@@ -7618,32 +8579,13 @@ static void HLE_Draw3D(uint8_t* base,
 {
     if (!g_d3d11.initialized || !g_d3d11.pipelineReady) return;
     if (!g_d3d11.vs3D || !g_d3d11.il3D || !g_d3d11.ps3D || !g_d3d11.cb3D) return;
-    if (PpDebug()) ++g_ppDrawsSinceRT;
-    if (RsDebug()) {
-        // Dedup: log each unique (blend, src, dst, colorMask, depthWrite,
-        // depthFunc) tuple once.
-        static std::unordered_set<uint64_t> s_seen;
-        uint64_t key =
-            (uint64_t(g_alphaBlendEnabled ? 1u : 0u) << 0) |
-            (uint64_t(g_blendSrc & 0xFFFF)           << 1) |
-            (uint64_t(g_blendDst & 0xFFFF)           << 17) |
-            (uint64_t(g_colorWriteMask)              << 33) |
-            (uint64_t(g_depthWriteEnable ? 1u : 0u) << 60) |
-            (uint64_t(g_depthFunc & 7)              << 61);
-        if (s_seen.insert(key).second && s_seen.size() < 64) {
-            fprintf(stderr,
-                "[RS] DRAW state: blendEn=%d src=0x%X dst=0x%X colorMask=0x%08X "
-                "depthWr=%d depthFn=0x%X\n",
-                (int)g_alphaBlendEnabled, g_blendSrc, g_blendDst,
-                g_colorWriteMask, (int)g_depthWriteEnable, g_depthFunc);
-        }
-    }
 
     // Assign this draw a stable index BEFORE any early-outs that would make
     // scene_dump.obj drop the same draw. Using a counter that increments for
     // every HLE_Draw3D call keeps the OBJ `o drawNNN_...` labels aligned with
     // the `[D3D] #NNN ...` log lines.
     const uint32_t drawIdx = g_draw3DIndex++;
+    if (PpDebug()) ++g_ppDrawsSinceRT;
 
     // Resolve current stream 0 (VB resource ptr + stride). v6 keeps the
     // stream table at kDeviceAddr + 0x1660 / +0x1664 (see SetStreamSource).
@@ -7654,7 +8596,12 @@ static void HLE_Draw3D(uint8_t* base,
     // D3DResource header stores the raw data pointer at +4 (virtual address).
     uint32_t vbData = X86_MEM_READ_u32(base, vbRes + 4);
     if (vbData == 0) vbData = vbRes + 0x0C; // fallback: inline data
-    vbData &= 0x3FFFFFFFu;
+    vbData &= (uint32_t)(X86_RAM_SIZE - 1u);
+    if (vbData == 0 || vbData >= (uint32_t)X86_RAM_SIZE) {
+        fprintf(stderr, "[HLE_Draw3D] invalid vbData=0x%08X (vbRes=0x%08X), skipping draw\n",
+                vbData, vbRes);
+        return;
+    }
 
     // Determine how many unique vertices we need to upload.
     //
@@ -7712,157 +8659,6 @@ static void HLE_Draw3D(uint8_t* base,
             s_lastVBBuf  = g_d3d11.dynamicVB;
             s_lastVBData = vbData;
             s_lastVBSize = vbBytes;
-        }
-    }
-
-    // DIAGNOSTIC: fnv-1a hash the VB content per draw, group by vbRes+vcount
-    // and log when the hash CHANGES frame-to-frame for the same VB. That
-    // confirms whether the game is uploading varying vertex data on a
-    // nominally-static garage mesh. Gated by B3_DEBUG_VB_HASH because the
-    // O(VB-bytes) hash on the per-draw hot path costs several milliseconds
-    // per frame in busy scenes.
-    if (g_dbg.vbHash)
-    {
-        auto hash_fnv = [](const uint8_t* p, size_t n) {
-            uint64_t h = 0xcbf29ce484222325ULL;
-            for (size_t i = 0; i < n; ++i) {
-                h ^= p[i];
-                h *= 0x100000001b3ULL;
-            }
-            return h;
-        };
-        uint64_t h = hash_fnv(base + vbData, vbBytes);
-        struct HashVal { uint64_t last; int changes; int seen; };
-        static std::unordered_map<uint64_t, HashVal> s_vbHash;
-        uint64_t key = ((uint64_t)vbRes << 32) ^ ((uint64_t)vcount << 8) ^ stride;
-        auto& v = s_vbHash[key];
-        v.seen++;
-        if (v.last != 0 && v.last != h) {
-            v.changes++;
-            if (v.changes <= 6) {
-                fprintf(stderr,
-                    "[VBHASH] vbRes=0x%08X vc=%u stride=%u CHANGED "
-                    "%016llX -> %016llX (seen=%d chg=%d)\n",
-                    vbRes, vcount, stride,
-                    (unsigned long long)v.last,
-                    (unsigned long long)h,
-                    v.seen, v.changes);
-            }
-        }
-        v.last = h;
-    }
-
-    // DIAGNOSTIC: dump the first N draw calls to a single OBJ file so the
-    // geometry can be inspected in Blender. We write each draw as its own
-    // "o drawNN" group; positions are taken from offset 0 (float3) of the
-    // VB, and triangles are reconstructed from the current topology. This
-    // lets us confirm mesh shape independently of the shader pipeline.
-    // Gated by B3_DEBUG_OBJ_DUMP — file I/O on the hot path is expensive.
-    if (g_dbg.objDump)
-    {
-        static FILE*    s_objFp         = nullptr;
-        static uint32_t s_objVertexBase = 0;   // global vertex counter (OBJ is 1-based)
-        static int      s_objDrawsLeft  = 64;  // dump first N draws then stop
-        if (s_objDrawsLeft > 0 && stride >= 12 && vcount >= 3) {
-            if (!s_objFp) {
-                s_objFp = std::fopen("scene_dump.obj", "w");
-                if (s_objFp) {
-                    std::fprintf(s_objFp,
-                        "# Burnout 3 Recomp diagnostic scene dump\n"
-                        "# coordinates are raw object-space (no transform)\n");
-                }
-            }
-            if (s_objFp) {
-                const uint8_t* vp = base + vbData;
-                // Positions
-                std::fprintf(s_objFp, "o draw%03u_prim%u_ic%u\n",
-                             drawIdx, primType,
-                             indexCount ? indexCount : vertexCount);
-                for (uint32_t v = 0; v < vcount; v++) {
-                    float xyz[3];
-                    std::memcpy(xyz, vp + v * stride, 12);
-                    std::fprintf(s_objFp, "v %.4f %.4f %.4f\n",
-                                 xyz[0], xyz[1], xyz[2]);
-                }
-                // Faces (1-based, global)
-                auto faceTri = [&](uint32_t a, uint32_t b, uint32_t c) {
-                    std::fprintf(s_objFp, "f %u %u %u\n",
-                                 s_objVertexBase + a + 1,
-                                 s_objVertexBase + b + 1,
-                                 s_objVertexBase + c + 1);
-                };
-                auto idx = [&](uint32_t i) -> uint32_t {
-                    if (indexCount) return X86_MEM_READ_u16(base, pIndexData + i * 2);
-                    return startVertex + i;
-                };
-                uint32_t n = indexCount ? indexCount : vertexCount;
-                switch (primType) {
-                case 5: // TRIANGLES
-                    for (uint32_t t = 0; t + 2 < n; t += 3)
-                        faceTri(idx(t), idx(t + 1), idx(t + 2));
-                    break;
-                case 6: // TRISTRIP
-                    for (uint32_t t = 0; t + 2 < n; t++) {
-                        if (t & 1) faceTri(idx(t + 1), idx(t), idx(t + 2));
-                        else       faceTri(idx(t), idx(t + 1), idx(t + 2));
-                    }
-                    break;
-                case 7: // TRIFAN
-                    for (uint32_t t = 1; t + 1 < n; t++)
-                        faceTri(idx(0), idx(t), idx(t + 1));
-                    break;
-                case 8: // QUADS
-                    for (uint32_t q = 0; q + 3 < n; q += 4) {
-                        faceTri(idx(q), idx(q + 1), idx(q + 2));
-                        faceTri(idx(q), idx(q + 2), idx(q + 3));
-                    }
-                    break;
-                default: break; // points/lines — skip
-                }
-                s_objVertexBase += vcount;
-                std::fflush(s_objFp);
-                s_objDrawsLeft--;
-                if (s_objDrawsLeft == 0) {
-                    std::fprintf(s_objFp, "# end of capture\n");
-                    std::fclose(s_objFp);
-                    s_objFp = nullptr;
-                    fprintf(stderr,
-                        "[HLE] scene_dump.obj closed at drawIdx=%u, %u vertices\n",
-                        drawIdx, s_objVertexBase);
-                }
-            }
-        }
-    }
-
-    // DIAGNOSTIC: dump the first few vertex positions so we can see the
-    // coordinate scale the game is feeding us. Position is at offset 0 of
-    // every Burnout 3 VB layout we've seen. Compute min/max over all verts
-    // for x/y/z so we can pick a sane synthetic projection.
-    {
-        static int s_vbDumpsLeft = 8;
-        if (s_vbDumpsLeft > 0 && stride >= 12 && vcount >= 1) {
-            const uint8_t* vp = base + vbData;
-            float mn[3] = {  1e30f,  1e30f,  1e30f };
-            float mx[3] = { -1e30f, -1e30f, -1e30f };
-            uint32_t scanN = vcount < 1024 ? vcount : 1024;
-            for (uint32_t v = 0; v < scanN; v++) {
-                float xyz[3];
-                memcpy(xyz, vp + v * stride, 12);
-                for (int k = 0; k < 3; k++) {
-                    if (!std::isfinite(xyz[k])) continue;
-                    if (xyz[k] < mn[k]) mn[k] = xyz[k];
-                    if (xyz[k] > mx[k]) mx[k] = xyz[k];
-                }
-            }
-            float p0[3], p1[3];
-            memcpy(p0, vp, 12);
-            memcpy(p1, vp + stride, 12);
-            fprintf(stderr,
-                "[VB] vc=%u stride=%u v0=(%.3f,%.3f,%.3f) v1=(%.3f,%.3f,%.3f) "
-                "bbox x=[%.3f,%.3f] y=[%.3f,%.3f] z=[%.3f,%.3f]\n",
-                vcount, stride, p0[0], p0[1], p0[2], p1[0], p1[1], p1[2],
-                mn[0], mx[0], mn[1], mx[1], mn[2], mx[2]);
-            s_vbDumpsLeft--;
         }
     }
 
@@ -7926,136 +8722,6 @@ static void HLE_Draw3D(uint8_t* base,
             }
         }
 
-        // ---- Debug: guest-shadow vs host-cache divergence probe.
-        // If the game bypasses our SetVertexShaderConstant* hooks and writes
-        // directly into the Xbox guest shadow at kVshConstantShadow
-        // (0x35FDF8 + reg*16), those writes show up here but NOT in
-        // g_vshConstants[]. Per-draw wheel/car instancing via RenderWare
-        // "current transform" is a prime suspect. We log both:
-        //   (a) every slot where shadow != host cache, first N events
-        //   (b) slots whose SHADOW value changed across successive draws
-        //       of the same VS handle (the true per-instance signal)
-        if (g_dbg.guestShadow) {
-            static uint32_t s_prevShadow[192][4] = {};
-            static uint32_t s_prevVs = 0;
-            static bool     s_prevInit = false;
-            static uint32_t s_mismatchLog = 0;
-            static uint32_t s_shadowChangeLog = 0;
-            uint32_t liveVS = LiveVSHandle(base);
-            for (uint32_t i = 0; i < 192; i++) {
-                uint32_t shadowW[4];
-                for (int k = 0; k < 4; k++) {
-                    shadowW[k] = X86_MEM_READ_u32(
-                        base, kVshConstantShadow + i * 16 + k * 4);
-                }
-                // (a) host vs shadow mismatch (logs first 128 events)
-                const uint32_t* hostW =
-                    reinterpret_cast<const uint32_t*>(&dst[i * 4]);
-                bool mismatch = false;
-                for (int k = 0; k < 4; k++) {
-                    if (shadowW[k] != hostW[k]) { mismatch = true; break; }
-                }
-                if (mismatch && s_mismatchLog < 128) {
-                    float fv[4];
-                    std::memcpy(fv, shadowW, 16);
-                    fprintf(stderr,
-                        "[SHADOW!=HOST] #%u vs=0x%08X c[%3u] "
-                        "host=[%8.3f %8.3f %8.3f %8.3f] "
-                        "shadow=[%8.3f %8.3f %8.3f %8.3f]\n",
-                        drawIdx, liveVS, i,
-                        dst[i*4+0], dst[i*4+1], dst[i*4+2], dst[i*4+3],
-                        fv[0], fv[1], fv[2], fv[3]);
-                    ++s_mismatchLog;
-                }
-                // (b) shadow-over-time change for same VS handle
-                if (s_prevInit && liveVS == s_prevVs
-                    && s_shadowChangeLog < 256) {
-                    bool changed = false;
-                    for (int k = 0; k < 4; k++) {
-                        if (shadowW[k] != s_prevShadow[i][k]) { changed = true; break; }
-                    }
-                    if (changed) {
-                        float fv[4];
-                        std::memcpy(fv, shadowW, 16);
-                        fprintf(stderr,
-                            "[SHADOWDIFF] #%u vs=0x%08X c[%3u] = [%8.3f %8.3f %8.3f %8.3f]\n",
-                            drawIdx, liveVS, i, fv[0], fv[1], fv[2], fv[3]);
-                        ++s_shadowChangeLog;
-                    }
-                }
-                for (int k = 0; k < 4; k++) s_prevShadow[i][k] = shadowW[k];
-            }
-            s_prevVs   = liveVS;
-            s_prevInit = true;
-        }
-
-        // DIAGNOSTIC: detect which VS-constant slots vary across successive
-        // draws of the SAME VS handle. We log the first ~256 change events.
-        // The per-object WORLD matrix (wheels vs car body) lives in whichever
-        // 4 consecutive slots flip between draws of the same shader.
-        if (g_dbg.slotDiff) {
-            static uint32_t s_prevSlotW[192][4] = {};
-            static uint32_t s_prevVs   = 0;
-            static bool     s_prevInit = false;
-            static uint32_t s_logCount = 0;
-            uint32_t liveVS = LiveVSHandle(base);
-            if (s_prevInit && liveVS == s_prevVs && s_logCount < 256) {
-                for (uint32_t i = 0; i < 192; i++) {
-                    const uint32_t* pw = reinterpret_cast<const uint32_t*>(&dst[i*4]);
-                    bool changed = false;
-                    for (int k = 0; k < 4; k++) {
-                        if (pw[k] != s_prevSlotW[i][k]) { changed = true; break; }
-                    }
-                    if (changed) {
-                        fprintf(stderr,
-                            "[SLOTDIFF] #%u vs=0x%08X c[%3u] = [%8.3f %8.3f %8.3f %8.3f]\n",
-                            drawIdx, liveVS, i,
-                            dst[i*4+0], dst[i*4+1], dst[i*4+2], dst[i*4+3]);
-                        ++s_logCount;
-                        if (s_logCount >= 256) break;
-                    }
-                }
-            }
-            // Update the cache regardless of VS match, so a shader switch
-            // doesn't dump a spurious 192-slot diff on the next matching draw.
-            for (uint32_t i = 0; i < 192; i++) {
-                const uint32_t* pw = reinterpret_cast<const uint32_t*>(&dst[i*4]);
-                for (int k = 0; k < 4; k++) s_prevSlotW[i][k] = pw[k];
-            }
-            s_prevVs   = liveVS;
-            s_prevInit = true;
-        }
-        #if 0
-        {
-            static uint64_t s_prevSlotHash[192] = {};
-            static uint32_t s_prevVs = 0;
-            static uint32_t s_logCount = 0;
-            if (g_currentVSHandle == s_prevVs && s_prevVs != 0) {
-                for (uint32_t i = 0; i < 192 && s_logCount < 64; i++) {
-                    uint64_t h = 1469598103934665603ull;
-                    const uint32_t* pw = reinterpret_cast<const uint32_t*>(&dst[i*4]);
-                    for (int k = 0; k < 4; k++) { h ^= pw[k]; h *= 1099511628211ull; }
-                    if (s_prevSlotHash[i] != 0 && s_prevSlotHash[i] != h) {
-                        fprintf(stderr,
-                            "[VSCVAR] vs=0x%08X c[%u] = [%.4f %.4f %.4f %.4f]\n",
-                            s_prevVs, i,
-                            dst[i*4+0], dst[i*4+1], dst[i*4+2], dst[i*4+3]);
-                        s_logCount++;
-                    }
-                    s_prevSlotHash[i] = h;
-                }
-            } else {
-                // New VS -> reset tracking
-                for (uint32_t i = 0; i < 192; i++) {
-                    uint64_t h = 1469598103934665603ull;
-                    const uint32_t* pw = reinterpret_cast<const uint32_t*>(&dst[i*4]);
-                    for (int k = 0; k < 4; k++) { h ^= pw[k]; h *= 1099511628211ull; }
-                    s_prevSlotHash[i] = h;
-                }
-            }
-            s_prevVs = g_currentVSHandle;
-        }
-        #endif
         // Force c[58]/c[59] to match our render viewport. The Xbox D3D runtime
         // writes these via SetViewport (through the NV2A push buffer); we don't
         // emulate that path, so without this override NV2A shaders that fold
@@ -8064,189 +8730,22 @@ static void HLE_Draw3D(uint8_t* base,
         // real viewport scale/offset, and then inverting that transform in the
         // translated HLSL epilogue, restores clip-space output.
         {
-            const float vpW = 640.0f, vpH = 480.0f;
-            dst[58*4+0] = vpW * 0.5f;  dst[58*4+1] = -vpH * 0.5f;
-            dst[58*4+2] = 1.0f;        dst[58*4+3] = 0.0f;
-            dst[59*4+0] = vpW * 0.5f;  dst[59*4+1] = vpH * 0.5f;
-            dst[59*4+2] = 0.0f;        dst[59*4+3] = 1.0f;
-        }
-        // DIAGNOSTIC: when c[112..115] is all zero (the engine's MVP-build
-        // routine writes to guest scratch buffers 0x004D66F0 / 0x004D6730
-        // that are never populated — see repo memory
-        // b3-3d-rendering-mvp-gap.md for the IDA investigation), inject a
-        // synthetic MVP so we can verify the rest of the pipeline. We try
-        // (a) identity first (works for screen-space helpers and any verts
-        // already in clip space), and if needed users can swap in a real
-        // perspective matrix below.
-        {
-            bool mvpAllZero = true;
-            for (int row = 112; row < 116 && mvpAllZero; row++) {
-                for (int k = 0; k < 4 && mvpAllZero; k++) {
-                    if (dst[row*4 + k] != 0.0f) mvpAllZero = false;
-                }
-            }
-            if (mvpAllZero) {
-                // Use the cached last-good VIEW and PROJ (populated by
-                // D3DDevice_SetTransform). The engine's
-                // SetVertexShaderConstant(112,...) path uploads zeros from
-                // dead scratch buffers, so we have to synthesize here.
+            uint32_t vpX = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 0);
+            uint32_t vpY = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 4);
+            uint32_t vpW = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 8);
+            uint32_t vpH = X86_MEM_READ_u32(base, kDeviceAddr + kDeviceViewport + 12);
+            if (vpW == 0) vpW = g_d3d11.width;
+            if (vpH == 0) vpH = g_d3d11.height;
+            
+            float fVpW = static_cast<float>(vpW);
+            float fVpH = static_cast<float>(vpH);
+            float fVpX = static_cast<float>(vpX);
+            float fVpY = static_cast<float>(vpY);
 
-                float mvp[16]; // row-vector MVP (= VIEW * PROJ)
-                bool usingReal = false;
-
-                if (g_haveView && g_haveProj) {
-                    // Row-major matrix multiply VIEW*PROJ, row-vector style:
-                    //   OUT[i][j] = sum_k VIEW[i][k] * PROJ[k][j]
-                    for (int r = 0; r < 4; r++)
-                      for (int c = 0; c < 4; c++) {
-                        float s = 0;
-                        for (int k = 0; k < 4; k++)
-                            s += g_lastGoodView[r*4+k] * g_lastGoodProj[k*4+c];
-                        mvp[r*4+c] = s;
-                      }
-                    usingReal = true;
-                } else {
-                    // Synthetic orbit fallback (legacy behaviour) — only
-                    // fires before the first valid SetTransform VIEW+PROJ.
-                    static auto s_startTime = std::chrono::steady_clock::now();
-                    auto now = std::chrono::steady_clock::now();
-                    float t = std::chrono::duration<float>(now - s_startTime).count();
-                    const float tgtX = 25.0f, tgtY = 2.0f, tgtZ = -7.0f;
-                    const float camDist   = 120.0f;
-                    const float camHeight = 25.0f;
-                    const float angSpeed  = 0.3f;
-                    float ang = angSpeed * t;
-                    float cx = tgtX + camDist * std::sin(ang);
-                    float cz = tgtZ + camDist * std::cos(ang);
-                    float cy = tgtY + camHeight;
-                    float ex = cx, ey = cy, ez = cz;
-                    float fx = tgtX - ex, fy = tgtY - ey, fz = tgtZ - ez;
-                    float flen = std::sqrt(fx*fx + fy*fy + fz*fz);
-                    fx /= flen; fy /= flen; fz /= flen;
-                    float rx =  fz, ry = 0, rz = -fx;
-                    float rlen = std::sqrt(rx*rx + rz*rz);
-                    rx /= rlen; rz /= rlen;
-                    float ux = fy*rz - fz*ry;
-                    float uy = fz*rx - fx*rz;
-                    float uz = fx*ry - fy*rx;
-                    float view[16] = {
-                        rx, ux, fx, 0,
-                        ry, uy, fy, 0,
-                        rz, uz, fz, 0,
-                        -(rx*ex + ry*ey + rz*ez),
-                        -(ux*ex + uy*ey + uz*ez),
-                        -(fx*ex + fy*ey + fz*ez),
-                        1
-                    };
-                    const float fovY   = 1.0471975f;
-                    const float aspect = 4.0f / 3.0f;
-                    const float zn = 0.5f, zf = 5000.0f;
-                    const float yScale = 1.0f / std::tan(fovY * 0.5f);
-                    const float xScale = yScale / aspect;
-                    const float zRange = zf / (zf - zn);
-                    float proj[16] = {
-                        xScale, 0,      0,                  0,
-                        0,      yScale, 0,                  0,
-                        0,      0,      zRange,             1,
-                        0,      0,     -zn*zRange,          0
-                    };
-                    for (int r = 0; r < 4; r++)
-                      for (int c = 0; c < 4; c++) {
-                        float s = 0;
-                        for (int k = 0; k < 4; k++) s += view[r*4+k] * proj[k*4+c];
-                        mvp[r*4+c] = s;
-                      }
-                }
-
-                // Transpose row-vector MVP into c[112..115] so the shader's
-                // column-vector DP4 produces the correct clip-space output.
-                for (int r = 0; r < 4; r++)
-                  for (int c = 0; c < 4; c++)
-                    dst[(112 + r)*4 + c] = mvp[c*4 + r];
-
-                // DIAGNOSTIC: log any time the injected MVP *meaningfully*
-                // changes. Capture a hash of c[112..115] so per-draw logs
-                // are deduped but every distinct matrix is shown.
-                uint64_t h = 1469598103934665603ull;
-                const uint32_t* pw = reinterpret_cast<const uint32_t*>(dst + 112*4);
-                for (int i = 0; i < 16; i++) { h ^= pw[i]; h *= 1099511628211ull; }
-                static uint64_t s_lastHash = 0;
-                static int s_distinct = 0;
-                if (h != s_lastHash && s_distinct < 24) {
-                    s_lastHash = h;
-                    s_distinct++;
-                    // fprintf(stderr,
-                    //     "[HLE] MVP-inject #%d %s\n"
-                    //     "         c112=[%.3f %.3f %.3f %.3f]\n"
-                    //     "         c113=[%.3f %.3f %.3f %.3f]\n"
-                    //     "         c114=[%.3f %.3f %.3f %.3f]\n"
-                    //     "         c115=[%.3f %.3f %.3f %.3f]\n",
-                    //     s_distinct,
-                    //     usingReal ? "(REAL VIEW*PROJ)" : "(synthetic orbit)",
-                    //     dst[112*4+0], dst[112*4+1], dst[112*4+2], dst[112*4+3],
-                    //     dst[113*4+0], dst[113*4+1], dst[113*4+2], dst[113*4+3],
-                    //     dst[114*4+0], dst[114*4+1], dst[114*4+2], dst[114*4+3],
-                    //     dst[115*4+0], dst[115*4+1], dst[115*4+2], dst[115*4+3]);
-                    // if (usingReal) {
-                    //     fprintf(stderr,
-                    //         "         VIEW=[%.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f /\n"
-                    //         "               %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f]\n"
-                    //         "         PROJ=[%.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f /\n"
-                    //         "               %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f]\n",
-                    //         g_lastGoodView[0],g_lastGoodView[1],g_lastGoodView[2],g_lastGoodView[3],
-                    //         g_lastGoodView[4],g_lastGoodView[5],g_lastGoodView[6],g_lastGoodView[7],
-                    //         g_lastGoodView[8],g_lastGoodView[9],g_lastGoodView[10],g_lastGoodView[11],
-                    //         g_lastGoodView[12],g_lastGoodView[13],g_lastGoodView[14],g_lastGoodView[15],
-                    //         g_lastGoodProj[0],g_lastGoodProj[1],g_lastGoodProj[2],g_lastGoodProj[3],
-                    //         g_lastGoodProj[4],g_lastGoodProj[5],g_lastGoodProj[6],g_lastGoodProj[7],
-                    //         g_lastGoodProj[8],g_lastGoodProj[9],g_lastGoodProj[10],g_lastGoodProj[11],
-                    //         g_lastGoodProj[12],g_lastGoodProj[13],g_lastGoodProj[14],g_lastGoodProj[15]);
-                    // }
-                }
-            }
-        }
-        // One-time scan: list every constant slot that holds non-zero data
-        // so we can figure out where the game actually stores its MVP.
-        static bool s_dumpedNonzero = false;
-        if (!s_dumpedNonzero) {
-            s_dumpedNonzero = true;
-            fprintf(stderr, "[HLE] non-zero VS constant slots:\n");
-            for (uint32_t i = 0; i < 192; i++) {
-                float a = dst[i*4+0], b = dst[i*4+1], c = dst[i*4+2], d = dst[i*4+3];
-                if (a != 0 || b != 0 || c != 0 || d != 0) {
-                    fprintf(stderr, "  c[%u] = [%.4f %.4f %.4f %.4f]\n",
-                            i, a, b, c, d);
-                }
-            }
-        }
-        static int s_logCB = 0;
-        if (s_logCB < 3) {
-            fprintf(stderr,
-                "[HLE] 3D cbuffer c[112..115]:\n"
-                "  c112=[%.4f %.4f %.4f %.4f]\n"
-                "  c113=[%.4f %.4f %.4f %.4f]\n"
-                "  c114=[%.4f %.4f %.4f %.4f]\n"
-                "  c115=[%.4f %.4f %.4f %.4f]\n",
-                dst[112*4+0], dst[112*4+1], dst[112*4+2], dst[112*4+3],
-                dst[113*4+0], dst[113*4+1], dst[113*4+2], dst[113*4+3],
-                dst[114*4+0], dst[114*4+1], dst[114*4+2], dst[114*4+3],
-                dst[115*4+0], dst[115*4+1], dst[115*4+2], dst[115*4+3]);
-            s_logCB++;
-        }
-        // Reflection-PS-specific probe: log c[96] (env-map UV scale/bias).
-        if (g_currentPSHandle == 0x008F9000 || g_currentPSHandle == 0x008FD000
-         || g_currentPSHandle == 0x008FF000) {
-            static int s_logC96 = 0;
-            if (s_logC96 < 6) {
-                fprintf(stderr,
-                    "[VS-refl] h=0x%08X c96=[%.4f %.4f %.4f %.4f] "
-                    "c58=[%.4f %.4f %.4f %.4f] c59=[%.4f %.4f %.4f %.4f]\n",
-                    g_currentPSHandle,
-                    dst[96*4+0], dst[96*4+1], dst[96*4+2], dst[96*4+3],
-                    dst[58*4+0], dst[58*4+1], dst[58*4+2], dst[58*4+3],
-                    dst[59*4+0], dst[59*4+1], dst[59*4+2], dst[59*4+3]);
-                ++s_logC96;
-            }
+            dst[58*4+0] = fVpW * 0.5f;         dst[58*4+1] = -fVpH * 0.5f;
+            dst[58*4+2] = 1.0f;                dst[58*4+3] = 0.0f;
+            dst[59*4+0] = fVpX + fVpW * 0.5f;  dst[59*4+1] = fVpY + fVpH * 0.5f;
+            dst[59*4+2] = 0.0f;                dst[59*4+3] = 1.0f;
         }
 
         // Hash-skip: if the staged buffer is bit-identical to the last one
@@ -8293,14 +8792,16 @@ static void HLE_Draw3D(uint8_t* base,
             }
         }
     }
+
     // Topology mapping.
     D3D_PRIMITIVE_TOPOLOGY topo;
     std::vector<uint16_t> fanOrQuadIdx; // used for expansion
     bool useExpanded = false;
+
     switch (primType) {
-    case 1: topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST; break;
-    case 2: topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST; break;
-    case 3: topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP; break;
+    case NV2A_PRIM_POINTS:    topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST; break;
+    case NV2A_PRIM_LINES:     topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST; break;
+    case NV2A_PRIM_LINESTRIP: topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP; break;
     case NV2A_PRIM_TRIANGLES: topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;  break;
     case NV2A_PRIM_TRISTRIP:  topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP; break;
     case NV2A_PRIM_TRIFAN: {
@@ -8345,6 +8846,30 @@ static void HLE_Draw3D(uint8_t* base,
         }
         break;
     }
+    case NV2A_PRIM_QUADSTRIP: {
+        topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        useExpanded = true;
+        if (indexCount) {
+            for (uint32_t i = 0; i + 3 < indexCount; i += 2) {
+                uint16_t a = X86_MEM_READ_u16(base, pIndexData + (i+0) * 2);
+                uint16_t b = X86_MEM_READ_u16(base, pIndexData + (i+1) * 2);
+                uint16_t c = X86_MEM_READ_u16(base, pIndexData + (i+2) * 2);
+                uint16_t d = X86_MEM_READ_u16(base, pIndexData + (i+3) * 2);
+                fanOrQuadIdx.push_back(a); fanOrQuadIdx.push_back(b); fanOrQuadIdx.push_back(c);
+                fanOrQuadIdx.push_back(b); fanOrQuadIdx.push_back(d); fanOrQuadIdx.push_back(c);
+            }
+        } else {
+            for (uint32_t i = 0; i + 3 < vertexCount; i += 2) {
+                uint16_t a = static_cast<uint16_t>(startVertex + i + 0);
+                uint16_t b = static_cast<uint16_t>(startVertex + i + 1);
+                uint16_t c = static_cast<uint16_t>(startVertex + i + 2);
+                uint16_t d = static_cast<uint16_t>(startVertex + i + 3);
+                fanOrQuadIdx.push_back(a); fanOrQuadIdx.push_back(b); fanOrQuadIdx.push_back(c);
+                fanOrQuadIdx.push_back(b); fanOrQuadIdx.push_back(d); fanOrQuadIdx.push_back(c);
+            }
+        }
+        break;
+    }
     default:
         return; // unsupported prim
     }
@@ -8363,6 +8888,19 @@ static void HLE_Draw3D(uint8_t* base,
         g_d3d11.context->Unmap(g_d3d11.dynamicIB, 0);
     }
 
+    bool useTexture = (g_currentPSHandle != 0 || ColorOpUsesTexture());
+    ID3D11ShaderResourceView* srv = nullptr;
+
+    if (useTexture) {
+        srv = ResolveShaderResourceView(base, 0, 0);
+        if (!srv) {
+            for (uint32_t stage = 1; stage < 4; ++stage) {
+                srv = ResolveShaderResourceView(base, stage, 0);
+                if (srv) break;
+            }
+        }
+    }
+
     // Resolve the currently bound texture (if any).
     // Burnout 3 uses programmable pixel shaders driven via the pushbuffer,
     // so the fixed-function TSS combiner state is stale for most 3D draws
@@ -8370,7 +8908,7 @@ static void HLE_Draw3D(uint8_t* base,
     // Bind whatever high-level texture the game selected with SetTexture,
     // falling back to push-buffer-shadowed NV2A state if that slot is empty.
     uint32_t texAddr = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
-    ID3D11ShaderResourceView* srv = nullptr;
+    srv = nullptr;
     bool colorOpOk = ColorOpUsesTexture();
     (void)colorOpOk;
     if (texAddr) {
@@ -8440,7 +8978,7 @@ static void HLE_Draw3D(uint8_t* base,
         g_blendSrc, g_blendDst, g_alphaBlendEnabled, g_colorWriteMask, g_blendEquation);
     SC_BlendState(bs3D, bf, 0xFFFFFFFF);
     {
-        bool depthEnable = !(g_dbg.noCull || boundGuestRT);
+        bool depthEnable = !g_dbg.noCull;
         ID3D11DepthStencilState* dss = depthEnable
             ? GetOrCreateDepthState(g_depthFunc, g_depthWriteEnable, true,
                                     g_stencilTestEnable,
@@ -8552,16 +9090,6 @@ static void HLE_Draw3D(uint8_t* base,
     // `(max(col.rgb,0.6), 1.0)` which renders as solid bright rectangles
     // for vertex colours like 0x00FFFFFF. Drop the draw rather than render
     // the artifact.
-    //if (!srv && !tps && ColorOpUsesTexture()) {
-    //    static int s_skipped3D = 0;
-    //    if (s_skipped3D++ < 32) {
-    //        fprintf(stderr,
-    //            "[PP] HLE_Draw3D SKIP textured combiner w/o SRV "
-    //            "prim=%u vc=%u op=%u arg1=%u arg2=%u\n",
-    //            primType, vcount, g_colorOp, g_colorArg1, g_colorArg2);
-    //    }
-    //    return;
-    //}
     if (tps) {
         // Upload psC[0..15] (plus zero-padding up to psC[32]) and bind at b0.
         if (g_d3d11.cbPS) {
@@ -8570,59 +9098,33 @@ static void HLE_Draw3D(uint8_t* base,
             // and Cxbx-Reloaded documents that these are maintained as
             // render-state indices 10..25 (X_D3DRS_PSCONSTANT0_0..
             // PSCONSTANT1_7) in 0xAARRGGBB format.
-            static int s_logRS = 0;
-            if (s_logRS < 4) {
-                fprintf(stderr,
-                    "[PSH] draw RS cache C0: %08X %08X %08X %08X | "
-                    "C1: %08X %08X %08X %08X dirty=0x%04X\n",
-                    g_hleRenderStateCache[10], g_hleRenderStateCache[11],
-                    g_hleRenderStateCache[12], g_hleRenderStateCache[13],
-                    g_hleRenderStateCache[18], g_hleRenderStateCache[19],
-                    g_hleRenderStateCache[20], g_hleRenderStateCache[21],
-                    g_pshConstantsDirty);
-                ++s_logRS;
-            }
-            // Per-reflection-PS diagnostic: log g_pshConstants[0..1] for the
-            // car reflection shader so we can see whether psC[0] (the
-            // reflection tint/weight) is actually populated at draw time.
-            if (g_currentPSHandle == 0x008F9000 || g_currentPSHandle == 0x008FD000
-             || g_currentPSHandle == 0x008FF000) {
-                static int s_refLog = 0;
-                if (s_refLog < 12) {
-                    fprintf(stderr, "[PSH-refl] h=0x%08X psC[0]=(%.3f,%.3f,%.3f,%.3f) "
-                                    "psC[1]=(%.3f,%.3f,%.3f,%.3f) psC[8]=(%.3f,%.3f,%.3f,%.3f) dirty=0x%04X\n",
-                            g_currentPSHandle,
-                            g_pshConstants[0][0], g_pshConstants[0][1], g_pshConstants[0][2], g_pshConstants[0][3],
-                            g_pshConstants[1][0], g_pshConstants[1][1], g_pshConstants[1][2], g_pshConstants[1][3],
-                            g_pshConstants[8][0], g_pshConstants[8][1], g_pshConstants[8][2], g_pshConstants[8][3],
-                            g_pshConstantsDirty);
-                    ++s_refLog;
-                }
-                // Also log live VS handle and any oT1-writing lines from its
-                // translated HLSL — to verify the env-map UV is computed
-                // correctly (sphere-map / reflection projection).
-                static std::unordered_set<uint32_t> s_refVsLogged;
-                uint32_t liveVS = LiveVSHandle(base);
-                if (s_refVsLogged.insert(liveVS).second) {
-                    auto vit = g_vsByHandle.find(liveVS);
-                    fprintf(stderr, "[PSH-refl] vsHandle=0x%08X cached=%d\n",
-                            liveVS, (int)(vit != g_vsByHandle.end() && vit->second.vs != nullptr));
-                    if (vit != g_vsByHandle.end() && !vit->second.hlsl.empty()) {
-                        const std::string& s = vit->second.hlsl;
-                        size_t lineStart = 0;
-                        int ot1Lines = 0;
-                        for (size_t i = 0; i <= s.size() && ot1Lines < 24; ++i) {
-                            if (i == s.size() || s[i] == '\n') {
-                                std::string line = s.substr(lineStart, i - lineStart);
-                                if (line.find("oT1") != std::string::npos ||
-                                    line.find("o.oT1") != std::string::npos) {
-                                    fprintf(stderr, "[PSH-refl]   %s\n", line.c_str());
-                                    ++ot1Lines;
-                                }
-                                lineStart = i + 1;
-                            }
-                        }
-                    }
+            //
+            // The canonical shadow in our HLE is g_hleRenderStateCache[],
+            // populated by __rwXbFlushCacheBuffer /
+            // D3DDevice_SetRenderStateNotInline. We also fall back to
+            // reading the Xbox guest-memory shadow at 0x35FB58 and the
+            // RW-pending array at 0x75D4A0 in case code paths bypass
+            // those hooks.
+            constexpr uint32_t kRSShadowBase  = 0x35FB58;
+            constexpr uint32_t kRWPendingBase = 0x75D4A0;
+            constexpr uint32_t kPSConstRsIdx  = 10; // X_D3DRS_PSCONSTANT0_0
+            for (uint32_t i = 0; i < 16; ++i) {
+                uint32_t rs = kPSConstRsIdx + i;
+                uint32_t v = 0;
+                if (rs < kHLERenderStateCount)
+                    v = g_hleRenderStateCache[rs];
+                if (v == 0)
+                    v = X86_MEM_READ_u32(base, kRSShadowBase + rs * 4);
+                if (v == 0)
+                    v = X86_MEM_READ_u32(base, kRWPendingBase + rs * 4);
+                
+                // Guard against clobbering constants cleanly set by SetPixelShaderConstant
+                if (v != 0 && !(g_pshConstantsDirty & (1u << i))) {
+                    g_pshConstants[i][0] = ((v >> 16) & 0xFF) / 255.0f;
+                    g_pshConstants[i][1] = ((v >>  8) & 0xFF) / 255.0f;
+                    g_pshConstants[i][2] = ((v >>  0) & 0xFF) / 255.0f;
+                    g_pshConstants[i][3] = ((v >> 24) & 0xFF) / 255.0f;
+                    g_pshConstantsDirty |= (1u << i);
                 }
             }
 
@@ -8719,32 +9221,38 @@ static void HLE_Draw3D(uint8_t* base,
         if (g_d3d11.activeGuestRT) {
             GuestRT* art = g_d3d11.activeGuestRT;
             uint32_t aMip = g_d3d11.activeGuestRTMip;
-            ID3D11ShaderResourceView* sub =
-                (aMip < art->srvSrcExclMip.size()) ? art->srvSrcExclMip[aMip]
-                                                   : nullptr;
+            ID3D11ShaderResourceView* sub = (aMip < art->srvSrcExclMip.size()) ? art->srvSrcExclMip[aMip] : nullptr;
             for (unsigned s = 0; s < 4; ++s) {
-                if (srvs[s] == art->srv) srvs[s] = sub;
+                if (srvs[s] == art->srv) {
+                    srvs[s] = sub;
+                } else if (aMip < art->srvPerMip.size() && srvs[s] == art->srvPerMip[aMip]) {
+                    uint32_t mw = std::max<uint32_t>(1, art->baseW >> aMip);
+                    uint32_t mh = std::max<uint32_t>(1, art->baseH >> aMip);
+                    EnsureScratchTexture(mw, mh, art->dxgiFormat);
+                    if (g_d3d11.scratchTex) {
+                        g_d3d11.context->CopySubresourceRegion(
+                            g_d3d11.scratchTex, 0, 0, 0, 0,
+                            art->texture, aMip, nullptr);
+                        srvs[s] = g_d3d11.scratchSRV;
+                    } else {
+                        srvs[s] = nullptr;
+                    }
+                }
             }
-        }
-        // Diagnostic: multi-stage draws.  If any stage >0 samples, show
-        // what texture addresses and SRVs are bound so we can tell whether
-        // the TV-static is coming from stale/garbage SRVs.
-        if (tps->usesStage[1] || tps->usesStage[2] || tps->usesStage[3]) {
-            // Log first N draws per unique PS handle so we identify all
-            // dual-stage shaders, not just the first 32 events.
-            static std::unordered_map<uint32_t, int> s_perHandleCount;
-            int& cnt = s_perHandleCount[g_currentPSHandle];
-            if (cnt < 4) {
-                fprintf(stderr,
-                    "[PSH] multi-stage draw: psh=0x%08X ps=%p uses=%d%d%d%d "
-                    "addrs=%08X,%08X,%08X,%08X srvs=%p,%p,%p,%p\n",
-                    g_currentPSHandle,
-                    (void*)tps->ps,
-                    tps->usesStage[0], tps->usesStage[1],
-                    tps->usesStage[2], tps->usesStage[3],
-                    stageAddr[0], stageAddr[1], stageAddr[2], stageAddr[3],
-                    (void*)srvs[0], (void*)srvs[1], (void*)srvs[2], (void*)srvs[3]);
-                ++cnt;
+        } else {
+            // Active RT is the Back Buffer
+            for (unsigned s = 0; s < 4; ++s) {
+                if (srvs[s] == g_d3d11.sceneSRV) {
+                    EnsureScratchTexture(g_d3d11.width, g_d3d11.height, g_d3d11.sceneFormat);
+                    if (g_d3d11.scratchTex) {
+                        g_d3d11.context->CopySubresourceRegion(
+                            g_d3d11.scratchTex, 0, 0, 0, 0,
+                            g_d3d11.backBufferTex, 0, nullptr);
+                        srvs[s] = g_d3d11.scratchSRV;
+                    } else {
+                        srvs[s] = nullptr;
+                    }
+                }
             }
         }
         SC_PSSRVs(4, srvs);
@@ -8762,6 +9270,20 @@ static void HLE_Draw3D(uint8_t* base,
                     srv = g_d3d11.activeGuestRT->srvSrcExclMip[aMip];
                 else
                     srv = nullptr;
+            } else if (g_d3d11.activeGuestRT && g_d3d11.activeGuestRTMip < g_d3d11.activeGuestRT->srvPerMip.size() && srv == g_d3d11.activeGuestRT->srvPerMip[g_d3d11.activeGuestRTMip]) {
+                GuestRT* art = g_d3d11.activeGuestRT;
+                uint32_t aMip = g_d3d11.activeGuestRTMip;
+                uint32_t mw = std::max<uint32_t>(1, art->baseW >> aMip);
+                uint32_t mh = std::max<uint32_t>(1, art->baseH >> aMip);
+                EnsureScratchTexture(mw, mh, art->dxgiFormat);
+                if (g_d3d11.scratchTex) {
+                    g_d3d11.context->CopySubresourceRegion(
+                        g_d3d11.scratchTex, 0, 0, 0, 0,
+                        art->texture, aMip, nullptr);
+                    srv = g_d3d11.scratchSRV;
+                } else {
+                    srv = nullptr;
+                }
             }
             ID3D11ShaderResourceView* one[1]   = { srv };
             ID3D11SamplerState*       samp1[1] = { g_d3d11.samplerWrap };
@@ -8775,52 +9297,13 @@ static void HLE_Draw3D(uint8_t* base,
     SC_VB(g_d3d11.dynamicVB, vbStride, vbOffset);
     SC_Topology(topo);
 
-    // ---- Debug: per-draw state log (correlates with scene_dump.obj) ----
-    if (g_dbg.drawLog) {
-        uint32_t liveVS = LiveVSHandle(base);
-        uint32_t psh    = g_currentPSHandle;
-        // Compute bbox over first N verts so wheels can be identified in logs.
-        float mn[3] = {  1e30f,  1e30f,  1e30f };
-        float mx[3] = { -1e30f, -1e30f, -1e30f };
-        uint32_t scanN = vcount < 256 ? vcount : 256;
-        if (stride >= 12) {
-            const uint8_t* vp = base + vbData;
-            for (uint32_t v = 0; v < scanN; v++) {
-                float xyz[3];
-                std::memcpy(xyz, vp + v * stride, 12);
-                for (int k = 0; k < 3; k++) {
-                    if (!std::isfinite(xyz[k])) continue;
-                    if (xyz[k] < mn[k]) mn[k] = xyz[k];
-                    if (xyz[k] > mx[k]) mx[k] = xyz[k];
-                }
-            }
-        }
-        uint32_t texAddr0 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
-        fprintf(stderr,
-            "[D3D] #%u vs=0x%08X ps=0x%08X tps=%d prim=%u vc=%u ic=%u "
-            "stride=%u tex=0x%08X bbox=[%.2f,%.2f,%.2f]..[%.2f,%.2f,%.2f]\n",
-            drawIdx, liveVS, psh, tps ? 1 : 0,
-            primType, vcount, indexCount, stride, texAddr0,
-            mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]);
+    {
+        wchar_t _m[128];
+        swprintf(_m, 128, L"f=%u d=%u RT=%08X 3D pt=%u %s",
+                 g_ppFrame, drawIdx, g_d3d11.currentRTSurf, primType,
+                 indexCount ? L"IDX" : L"VTX");
+        RdocMark(_m);
     }
-
-    // ---- Debug: replace PS with a unique-per-draw color. Decouples the
-    // "does geometry reach the raster" question from the PS translation.
-    if (g_dbg.colorPS && g_d3d11.psDebugColor && g_d3d11.cbDebug) {
-        D3D11_MAPPED_SUBRESOURCE dmr{};
-        if (SUCCEEDED(g_d3d11.context->Map(g_d3d11.cbDebug, 0,
-                D3D11_MAP_WRITE_DISCARD, 0, &dmr))) {
-            float* f = reinterpret_cast<float*>(dmr.pData);
-            f[0] = static_cast<float>(drawIdx + 1);
-            f[1] = 0.0f; f[2] = 0.0f; f[3] = 0.0f;
-            g_d3d11.context->Unmap(g_d3d11.cbDebug, 0);
-        }
-        SC_PS(g_d3d11.psDebugColor);
-        SC_PSCB0(g_d3d11.cbDebug);
-        ID3D11ShaderResourceView* nullSRVs[4] = {};
-        SC_PSSRVs(4, nullSRVs);
-    }
-
     if (useExpanded) {
         SC_IB(g_d3d11.dynamicIB, DXGI_FORMAT_R16_UINT, 0);
         g_d3d11.context->DrawIndexed(drawIndexCount, 0, 0);
@@ -8829,34 +9312,6 @@ static void HLE_Draw3D(uint8_t* base,
         g_d3d11.context->DrawIndexed(indexCount, 0, 0);
     } else {
         g_d3d11.context->Draw(vertexCount, startVertex);
-    }
-
-    // ---- Debug: wireframe overlay pass. Uses the debug color PS + wireframe
-    // RS + depth test OFF so submitted-but-occluded geometry is visible.
-    if (g_dbg.wireframe && g_d3d11.rsWire && g_d3d11.psDebugColor
-        && g_d3d11.cbDebug) {
-        D3D11_MAPPED_SUBRESOURCE dmr{};
-        if (SUCCEEDED(g_d3d11.context->Map(g_d3d11.cbDebug, 0,
-                D3D11_MAP_WRITE_DISCARD, 0, &dmr))) {
-            float* f = reinterpret_cast<float*>(dmr.pData);
-            // Offset by a large bias so overlay colors differ from pass 1.
-            f[0] = static_cast<float>(drawIdx + 10001);
-            f[1] = 1.0f; f[2] = 0.0f; f[3] = 0.0f;
-            g_d3d11.context->Unmap(g_d3d11.cbDebug, 0);
-        }
-        SC_Raster(g_d3d11.rsWire);
-        SC_DepthStencil(g_d3d11.dssOff, 0);
-        SC_PS(g_d3d11.psDebugColor);
-        SC_PSCB0(g_d3d11.cbDebug);
-        ID3D11ShaderResourceView* nullSRVs[4] = {};
-        SC_PSSRVs(4, nullSRVs);
-        if (useExpanded) {
-            g_d3d11.context->DrawIndexed(drawIndexCount, 0, 0);
-        } else if (indexCount) {
-            g_d3d11.context->DrawIndexed(indexCount, 0, 0);
-        } else {
-            g_d3d11.context->Draw(vertexCount, startVertex);
-        }
     }
 
     // Unbind SRV to avoid hazards between subsequent 2D passes.
@@ -8871,13 +9326,35 @@ static void HLE_Draw3D(uint8_t* base,
 
 // Handles all Xbox/NV2A primitive types by expanding to tri-lists or strips.
 static void DrawSWVertsD3D11(uint8_t* base, const SWVertex* sv, size_t n, int primType,
-                              ID3D11ShaderResourceView* srv, bool isAlphaOnly)
+                              ID3D11ShaderResourceView* srv, bool isAlphaOnly,
+                              uint32_t srcTexW = 0, uint32_t srcTexH = 0)
 {
     if (n == 0 || !g_d3d11.initialized) return;
 
+    // Normalize pixel-space UV coordinates to 0-1 for D3D11 sampler.
+    // sub_3DA90 writes UV in screen-pixel space (0..srcTexW, 0..srcTexH)
+    // both via D3DDevice_SetVertexData2f and via raw NV2A push-buffer methods.
+    // Detect pixel-space by checking whether any vertex has |u| or |v| > 2.
+    // Use source texture dimensions when provided; fall back to g_bbWidth/g_bbHeight.
+    uint32_t normW = (srcTexW > 0) ? srcTexW : g_bbWidth;
+    uint32_t normH = (srcTexH > 0) ? srcTexH : g_bbHeight;
+    bool needsUVNorm = false;
+    if (normW > 0 && normH > 0) {
+        for (size_t i = 0; i < n; i++) {
+            if (sv[i].u > 2.0f || sv[i].v > 2.0f ||
+                sv[i].u < -2.0f || sv[i].v < -2.0f) {
+                needsUVNorm = true; break;
+            }
+        }
+    }
+    float uvScaleU = needsUVNorm ? (1.0f / (float)normW) : 1.0f;
+    float uvScaleV = needsUVNorm ? (1.0f / (float)normH) : 1.0f;
+
     std::vector<Vtx2D> verts;
     verts.reserve(n * 2);
-    auto push = [&](const SWVertex& v) { verts.push_back({v.x, v.y, v.u, v.v, v.diffuse}); };
+    auto push = [&](const SWVertex& v) {
+        verts.push_back({v.x, v.y, v.u * uvScaleU, v.v * uvScaleV, v.diffuse});
+    };
 
     D3D_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
@@ -8885,7 +9362,6 @@ static void DrawSWVertsD3D11(uint8_t* base, const SWVertex* sv, size_t n, int pr
     // X_D3DPT values overlap with NV2A values so they are NOT combined here.
     switch (primType) {
     case NV2A_PRIM_TRIANGLES:   // 5
-    case X_D3DPT_TRIANGLELIST:  // 4
         topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         for (size_t i = 0; i < n; i++) push(sv[i]);
         break;
@@ -8898,7 +9374,6 @@ static void DrawSWVertsD3D11(uint8_t* base, const SWVertex* sv, size_t n, int pr
         for (size_t i = 1; i + 1 < n; i++) { push(sv[0]); push(sv[i]); push(sv[i+1]); }
         break;
     case NV2A_PRIM_QUADS:       // 8
-    case X_D3DPT_QUADLIST:      // 13
         topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         for (size_t i = 0; i + 3 < n; i += 4) {
             push(sv[i]); push(sv[i+1]); push(sv[i+2]);
@@ -8906,7 +9381,6 @@ static void DrawSWVertsD3D11(uint8_t* base, const SWVertex* sv, size_t n, int pr
         }
         break;
     case NV2A_PRIM_QUADSTRIP:   // 9
-    case X_D3DPT_QUADSTRIP:     // 14
         topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         for (size_t i = 0; i + 3 < n; i += 2) {
             push(sv[i]); push(sv[i+1]); push(sv[i+2]);
@@ -8928,64 +9402,65 @@ static void DrawSWVertsD3D11(uint8_t* base, const SWVertex* sv, size_t n, int pr
 // Full draw: resolve texture from guest state then call DrawSWVertsD3D11
 static void DrawSWVertsWithTexD3D11(uint8_t* base, const SWVertex* sv, size_t n, int primType)
 {
-    uint32_t texAddr = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
-    // Bind slot 0 when either (a) the FF combiner consumes the texture, or
-    // (b) a programmable pixel shader is active. Burnout 3 leaves the FF
-    // ColorOp at DISABLE while its programmable PS samples slot 0, so
-    // gating purely on ColorOpUsesTexture() drops the binding and we'd
-    // render psUntextured (white rectangles). When neither applies (FF +
-    // ColorOp=DISABLE) the draw is genuinely untextured and we must NOT
-    // bind a stale slot-0 texture — doing so corrupts vertex-color-only
-    // geometry (HUD bars, loading screen).
-    bool useTexture  = (texAddr != 0) && (g_currentPSHandle != 0 || ColorOpUsesTexture());
-
+    bool useTexture = (g_currentPSHandle != 0 || ColorOpUsesTexture());
     ID3D11ShaderResourceView* srv = nullptr;
     bool isAlphaOnly = false;
-    if (g_nv2aTexture[0].dirty) {
-        srv = ResolveNV2ATextureSRV(base, 0);
-    } else if (useTexture) {
-        srv = GetOrCreateTextureSRV(base, texAddr);
-    } else {
-        srv = ResolveNV2ATextureSRV(base, 0);
-    }
 
-    if (srv && !g_nv2aTexture[0].dirty && texAddr) {
-        auto it = g_d3d11.textureCache.find(texAddr);
-        if (it != g_d3d11.textureCache.end())
-            isAlphaOnly = it->second.isAlphaOnly;
-    }
-
-    // Post-process fallback: many Burnout 3 fullscreen-quad PP passes
-    // (bloom composite, lens flare, motion-blur edges) bind the scene/RT
-    // texture at stage 1 (or another non-zero stage) instead of stage 0,
-    // and rely on a programmable pixel shader we can't translate yet.
-    // Without this, the draw renders solid vertex-color (white rectangles
-    // covering the screen) because we picked psUntextured. As a graceful
-    // fallback, sample whichever stage *is* bound so the scene at least
-    // shows through.
-    if (!srv) {
-        for (uint32_t stage = 1; stage < 4; ++stage) {
-            uint32_t a = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + stage * 4);
-            if (g_nv2aTexture[stage].dirty) {
-                srv = ResolveNV2ATextureSRV(base, stage);
-            } else if (a) {
-                srv = GetOrCreateTextureSRV(base, a);
-            } else {
-                srv = ResolveNV2ATextureSRV(base, stage);
-            }
-            if (srv) {
-                texAddr = a;
-                if (!g_nv2aTexture[stage].dirty && a) {
-                    auto it = g_d3d11.textureCache.find(a);
-                    if (it != g_d3d11.textureCache.end())
-                        isAlphaOnly = it->second.isAlphaOnly;
-                }
-                break;
+    uint32_t texAddr0 = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
+    uint32_t rtSurf   = g_d3d11.currentRTSurf;
+    
+    if (useTexture) {
+        srv = ResolveShaderResourceView(base, 0, 0, &isAlphaOnly);
+        if (!srv) {
+            for (uint32_t stage = 1; stage < 4; ++stage) {
+                srv = ResolveShaderResourceView(base, stage, 0, &isAlphaOnly);
+                if (srv) break;
             }
         }
     }
 
-    DrawSWVertsD3D11(base, sv, n, primType, srv, isAlphaOnly);
+    // Look up source texture dimensions so DrawSWVertsD3D11 uses the correct
+    // UV normalization divisor (rather than the global g_bbWidth/g_bbHeight
+    // which is always 640x480, even when the source RT is 320x240 or 160x120).
+    uint32_t srcTexW = 0, srcTexH = 0;
+    if (texAddr0) {
+        auto itSrc = g_d3d11.guestRTBySurface.find(texAddr0);
+        if (itSrc != g_d3d11.guestRTBySurface.end() && itSrc->second.rt) {
+            srcTexW = itSrc->second.rt->baseW;
+            srcTexH = itSrc->second.rt->baseH;
+        }
+    }
+
+    // Letterbox position fix (PS=0x008FC000): The scene RT now has content in
+    // all rows 0..479 from the expanded 3D viewport (Fix 3).  But the game's
+    // composite quad sits in the Xbox letterbox band (pos_y = vpY..vpY+vpH,
+    // nominally 16..464) and the CB2D transform maps it only to backbuffer
+    // rows 16..464, leaving black gaps at top and bottom.  Remap the vertex
+    // Y positions from the content band to the full screen so the composite
+    // covers rows 0..479.  UV stays unchanged; the full-height source RT is
+    // sampled end-to-end.
+    if (g_currentPSHandle == 0x008FC000u && n <= 4) {
+        float minY = sv[0].y, maxY = sv[0].y;
+        for (size_t i = 1; i < n; ++i) {
+            if (sv[i].y < minY) minY = sv[i].y;
+            if (sv[i].y > maxY) maxY = sv[i].y;
+        }
+        float fullH = static_cast<float>(g_bbHeight);
+        float spanH = maxY - minY;
+        // Only apply to symmetric letterbox quads (top bar height == bottom bar height).
+        if (minY > 0.5f && spanH > 0.5f && fabsf((fullH - maxY) - minY) < 2.0f) {
+            SWVertex adjVerts[4];
+            float invSpan = fullH / spanH;
+            for (size_t i = 0; i < n; ++i) {
+                adjVerts[i]   = sv[i];
+                adjVerts[i].y = (sv[i].y - minY) * invSpan;
+            }
+            DrawSWVertsD3D11(base, adjVerts, n, primType, srv, isAlphaOnly, srcTexW, srcTexH);
+            return;
+        }
+    }
+
+    DrawSWVertsD3D11(base, sv, n, primType, srv, isAlphaOnly, srcTexW, srcTexH);
 }
 
 // ---- Texture sampling support for the software rasterizer ----
@@ -9185,85 +9660,33 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
         return;
     }
 
+    // Process any pending NV2A push-buffer writes (blend state, texture stages,
+    // etc.) that were flushed by _rwXbFlushCacheBuffer before this draw.
+    // Without this call the blur/post-FX setup done by sub_45EE0/sub_40F90
+    // (alpha blend enable, src/dst factors, texture bindings) is never applied.
+    WalkPushBuffer(base);
 
     uint32_t texAddr = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
     // See note in DrawSWVertsWithTexD3D11.
-    bool useTexture  = (texAddr != 0) && (g_currentPSHandle != 0 || ColorOpUsesTexture());
+    bool useTexture = (g_currentPSHandle != 0 || ColorOpUsesTexture());
     ID3D11ShaderResourceView* srv = nullptr;
+
     bool isAlphaOnly = false;
     uint32_t texW = 1, texH = 1;
-    if (g_nv2aTexture[0].dirty) {
-        srv = ResolveNV2ATextureSRV(base, 0);
-    } else if (useTexture) {
-        srv = GetOrCreateTextureSRV(base, texAddr);
-    } else {
-        srv = ResolveNV2ATextureSRV(base, 0);
-    }
-    if (srv) {
-        if (!g_nv2aTexture[0].dirty && texAddr) {
-            auto it = g_d3d11.textureCache.find(texAddr);
-            if (it != g_d3d11.textureCache.end()) {
-                isAlphaOnly = it->second.isAlphaOnly;
-                texW = it->second.width;
-                texH = it->second.height;
-            }
-        } else {
-            const NV2ATextureState& st = g_nv2aTexture[0];
-            if (st.imageRect != 0) {
-                texW = (st.imageRect >> 16) & 0xFFFF;
-                texH = (st.imageRect >>  0) & 0xFFFF;
+    
+    if (useTexture) {
+        srv = ResolveShaderResourceView(base, 0, 0, &isAlphaOnly, nullptr, &texW, &texH);
+        if (!srv) {
+            for (uint32_t stage = 1; stage < 4; ++stage) {
+                srv = ResolveShaderResourceView(base, stage, 0, &isAlphaOnly, nullptr, &texW, &texH);
+                if (srv) break;
             }
         }
-        if (texW == 0) texW = 1;
-        if (texH == 0) texH = 1;
-    }
-    
-    if (!srv) {
-        for (uint32_t stage = 1; stage < 4; ++stage) {
-            uint32_t a = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + stage * 4);
-            if (g_nv2aTexture[stage].dirty) {
-                srv = ResolveNV2ATextureSRV(base, stage);
-            } else if (a) {
-                srv = GetOrCreateTextureSRV(base, a);
-            } else {
-                srv = ResolveNV2ATextureSRV(base, stage);
-            }
-            
-            if (srv) {
-                texAddr = a;
-                if (!g_nv2aTexture[stage].dirty && a) {
-                    auto it = g_d3d11.textureCache.find(a);
-                    if (it != g_d3d11.textureCache.end()) {
-                        isAlphaOnly = it->second.isAlphaOnly;
-                        texW = it->second.width;
-                        texH = it->second.height;
-                    }
-                } else {
-                    const NV2ATextureState& st = g_nv2aTexture[stage];
-                    if (st.imageRect != 0) {
-                        texW = (st.imageRect >> 16) & 0xFFFF;
-                        texH = (st.imageRect >>  0) & 0xFFFF;
-                    }
-                }
-                if (texW == 0) texW = 1;
-                if (texH == 0) texH = 1;
-                break;
-            }
-        }
-    }
-    
-    uint32_t fvf = g_currentFVF;
-    if (!(fvf & D3DFVF_XYZRHW) && !(fvf & D3DFVF_XYZ)) {
-        // Guess FVF from stride if invalid (RenderWare typically sets FVF to 0 for these)
-        if (vtxStride == 28) fvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | (1 << D3DFVF_TEXCOUNT_SHIFT);
-        else if (vtxStride == 24) fvf = D3DFVF_XYZRHW | (1 << D3DFVF_TEXCOUNT_SHIFT);
-        else if (vtxStride == 20) fvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE;
-        else fvf = D3DFVF_XYZRHW;
     }
 
-    // Detect if UVs are in pixel coordinates
+    // Detect if UVs are in pixel coordinates (only relevant for the non-stride-28/52 format)
     bool uvInPixels = false;
-    if (vtxStride != 28 && vtxStride != 24 && srv && texW > 1 && texH > 1) {
+    if (vtxStride != 28 && vtxStride != 52 && srv && texW > 1 && texH > 1) {
         float maxUV = 0.0f;
         for (uint32_t i = 0; i < vtxCount; i++) {
             uint32_t off = pVtxData + i * vtxStride;
@@ -9278,8 +9701,113 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
         uvInPixels = (maxUV > 2.0f);
     }
 
-    // Build normalized Vtx2D array
-    std::vector<Vtx2D> v2d(vtxCount);
+    // Determine whether to build extended (4-UV) vertex data for translated-PS draws.
+    // stride=52 = XYZRHW(16) + DIFFUSE(4) + UV0..UV3(4×8) used by blur/post-FX quads.
+    const bool buildExVerts = (vtxStride == 52) && (g_currentPSHandle != 0);
+
+    // Per-stage UV affine normalization for ExPath (stride=52 post-FX quads).
+    //
+    // The Xbox vertex data stores UVs in pixel space, but the direction of V
+    // varies by draw:
+    //   - Blur draw  (PS 0x00900000): V decreases from top→bottom (17.8→-16),
+    //     so simple /height gives a tiny range that wraps badly.
+    //   - Composite  (PS 0x00901000): V increases from top→bottom (1.3→238.5),
+    //     so /height works, but vertex-range is cleaner and exact.
+    //
+    // The unified formula for both:
+    //   u_norm = (u_pixel - u_left) / (u_right - u_left)
+    //   v_norm = (v_pixel - v_top)  / (v_bot   - v_top)
+    //
+    // where v_top is the V value at the screen-top vertex and v_bot is at the
+    // screen-bottom vertex.  When v_top > v_bot the denominator is negative and
+    // v_norm increases correctly from 0→1 top→bottom.
+    struct UVAffine { float uOff, uRng, vOff, vRng; };
+    UVAffine uvAff[4] = {};
+    for (int s = 0; s < 4; s++) { uvAff[s] = {0.0f, 1.0f, 0.0f, 1.0f}; }
+
+    if (buildExVerts && vtxCount >= 2) {
+        // Pre-scan: find top/bottom/left/right vertices in screen space.
+        // For screen-space draws (all Y ≥ 0): min Y = screen top.
+        // For centered draws   (some Y < 0): max Y = screen top (+Y = up).
+        float scanMinY = FLT_MAX, scanMaxY = -FLT_MAX;
+        float scanMinX = FLT_MAX, scanMaxX = -FLT_MAX;
+        uint32_t minYidx = 0, maxYidx = 0, minXidx = 0, maxXidx = 0;
+        for (uint32_t i = 0; i < vtxCount; i++) {
+            uint32_t soff = pVtxData + i * vtxStride;
+            float sx, sy;
+            memcpy(&sx, base + soff,     4);
+            memcpy(&sy, base + soff + 4, 4);
+            if (sy < scanMinY) { scanMinY = sy; minYidx = i; }
+            if (sy > scanMaxY) { scanMaxY = sy; maxYidx = i; }
+            if (sx < scanMinX) { scanMinX = sx; minXidx = i; }
+            if (sx > scanMaxX) { scanMaxX = sx; maxXidx = i; }
+        }
+        // PS=0x00901000 (blur composite) always uses centred Y coordinates
+        // (+Y = up, 0 = screen centre) even when a sub-quad doesn't cross
+        // zero (e.g. the top-half split quad Y=0..+16 has scanMinY=0).
+        // Force isCentered for that PS handle so topIdx/botIdx are correct.
+        bool isCentered = (scanMinY < 0.0f) || (g_currentPSHandle == 0x00901000u);
+        uint32_t topIdx   = isCentered ? maxYidx : minYidx;
+        uint32_t botIdx   = isCentered ? minYidx : maxYidx;
+        uint32_t leftIdx  = minXidx;
+        uint32_t rightIdx = maxXidx;
+
+        // Derive the affine transform from STAGE 0 only, then share it across
+        // all stages.  Per-stage independent normalization would map every stage
+        // to exactly [0,1], erasing the small inter-stage UV offsets that carry
+        // the motion-blur streak direction.  Using stage 0 as the reference
+        // keeps those offsets intact (e.g. stage 1 might end up at 0.054..1.079
+        // in V, i.e. shifted ~5% down — that IS the blur streak).
+        {
+            float uL, uR, vT, vB;
+            memcpy(&uL, base + pVtxData + leftIdx  * vtxStride + 20, 4); // stage0 U
+            memcpy(&uR, base + pVtxData + rightIdx * vtxStride + 20, 4);
+            memcpy(&vT, base + pVtxData + topIdx   * vtxStride + 24, 4); // stage0 V
+            memcpy(&vB, base + pVtxData + botIdx   * vtxStride + 24, 4);
+            float uRng = uR - uL;
+            float vRng = vB - vT;
+            UVAffine shared = {
+                uL, (fabsf(uRng) > 1e-6f) ? uRng : 1.0f,
+                vT, (fabsf(vRng) > 1e-6f) ? vRng : 1.0f
+            };
+            for (int s = 0; s < 4; s++) uvAff[s] = shared;
+        }
+
+        // For the blur draw (PS 0x00900000), override with per-stage
+        // texture-dimension normalization to achieve correct center-out streaks.
+        // Stage0 is the scene texture (640x480); stages 1-3 are the bloom
+        // texture (160x120).  The game stores all UVs in scene-width units
+        // for U but bloom-height units for V.  Normalising stage-1 V by 120
+        // (not 480) moves the vanishing point to ~V=0.46 on screen (near
+        // centre), giving outward-radiating streaks.  Wrap-unrolling of
+        // negative V is performed in the vertex loop below.
+        if (g_currentPSHandle == 0x00900000u) {
+            uvAff[0] = { 0.f, 640.f, 0.f, 480.f }; // stage0: scene  U÷640 V÷480
+            uvAff[1] = { 0.f, 640.f, 0.f, 120.f }; // stage1: bloom  U÷640 V÷120
+            uvAff[2] = { 0.f, 640.f, 0.f, 480.f }; // stage2: scene  U÷640 V÷480
+            uvAff[3] = { 0.f, 640.f, 0.f, 480.f }; // stage3: scene  U÷640 V÷480
+        }
+
+        // For the blur composite (PS 0x00901000), override stages 0-2 with
+        // fixed texture-dimension normalization.  The blur-accum buffer is
+        // 320×240, so U÷320 V÷240 maps every sample to [0,1] exactly:
+        //   stage0: blur accum (320×240)
+        //   stage1: main RT, but UV is in 320×240 "blur-accum pixel" units
+        //   stage2: main RT (same unit space)
+        //   stage3: intentionally left vertex-derived (keeps inter-stage streak)
+        if (g_currentPSHandle == 0x00901000u) {
+            uvAff[0] = { 0.f, 320.f, 0.f, 240.f };
+            uvAff[1] = { 0.f, 320.f, 0.f, 240.f };
+            uvAff[2] = { 0.f, 320.f, 0.f, 240.f };
+            // uvAff[3]: intentionally shared (vertex-derived)
+        }
+    }
+
+    // Build normalized Vtx2D array (and optional Vtx2DEx for stride=52 TPS draws)
+    std::vector<Vtx2D>   v2d(vtxCount);
+    std::vector<Vtx2DEx> v2dEx;
+    if (buildExVerts) v2dEx.reserve(vtxCount);
+
     for (uint32_t i = 0; i < vtxCount; i++) {
         uint32_t off = pVtxData + i * vtxStride;
         float x, y, u = 0.0f, v = 0.0f;
@@ -9332,6 +9860,39 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
             col = X86_MEM_READ_u32(base, off + 16);
             memcpy(&u, base + off + 20, 4);
             memcpy(&v, base + off + 24, 4);
+        } else if (vtxStride == 52) {
+            // D3DFVF_XYZRHW|DIFFUSE|TEX4: X@0,Y@4,Z@8,W@12,col@16,U0@20,V0@24,...U3@44,V3@48
+            col = X86_MEM_READ_u32(base, off + 16);
+            memcpy(&u, base + off + 20, 4);  // UV0.u — primary UV for stage 0
+            memcpy(&v, base + off + 24, 4);  // UV0.v
+            if (buildExVerts) {
+                Vtx2DEx ex;
+                ex.x = x; ex.y = y; ex.color = col;
+                memcpy(&ex.u0, base + off + 20, 4); memcpy(&ex.v0, base + off + 24, 4);
+                memcpy(&ex.u1, base + off + 28, 4); memcpy(&ex.v1, base + off + 32, 4);
+                memcpy(&ex.u2, base + off + 36, 4); memcpy(&ex.v2, base + off + 40, 4);
+                memcpy(&ex.u3, base + off + 44, 4); memcpy(&ex.v3, base + off + 48, 4);
+                // For the blur draw, unroll negative V values before normalization
+                // so that GPU linear interpolation stays within [0,1] and does not
+                // cross the wrap boundary (which would produce wrong centre values).
+                if (g_currentPSHandle == 0x00900000u) {
+                    if (ex.v0 < 0.f) ex.v0 += 480.f; // stage0: scene height
+                    if (ex.v1 < 0.f) ex.v1 += 120.f; // stage1: bloom height
+                    if (ex.v2 < 0.f) ex.v2 += 480.f; // stage2: scene height
+                    if (ex.v3 < 0.f) ex.v3 += 480.f; // stage3: scene height
+                }
+                // Normalize pixel-space UVs to 0-1 using per-stage affine transform.
+                // v_norm = (v_pixel - v_top) / (v_bot - v_top); negative range flips V.
+                ex.u0 = (ex.u0 - uvAff[0].uOff) / uvAff[0].uRng;
+                ex.v0 = (ex.v0 - uvAff[0].vOff) / uvAff[0].vRng;
+                ex.u1 = (ex.u1 - uvAff[1].uOff) / uvAff[1].uRng;
+                ex.v1 = (ex.v1 - uvAff[1].vOff) / uvAff[1].vRng;
+                ex.u2 = (ex.u2 - uvAff[2].uOff) / uvAff[2].uRng;
+                ex.v2 = (ex.v2 - uvAff[2].vOff) / uvAff[2].vRng;
+                ex.u3 = (ex.u3 - uvAff[3].uOff) / uvAff[3].uRng;
+                ex.v3 = (ex.v3 - uvAff[3].vOff) / uvAff[3].vRng;
+                v2dEx.push_back(ex);
+            }
         } else {
             memcpy(&x, base + off,     4);
             memcpy(&y, base + off + 4, 4);
@@ -9351,17 +9912,29 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
     }
 
     // Map NV2A primitive types to D3D11 topology (expand fans/quads)
-    std::vector<Vtx2D> expanded;
+    std::vector<Vtx2D>   expanded;
+    std::vector<Vtx2DEx> expandedEx;
     D3D_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+
+    // Helper: expand ex-verts with same index pattern as v2d
+    auto pushEx3 = [&](uint32_t a, uint32_t b, uint32_t c) {
+        if (!v2dEx.empty()) {
+            expandedEx.push_back(v2dEx[a]);
+            expandedEx.push_back(v2dEx[b]);
+            expandedEx.push_back(v2dEx[c]);
+        }
+    };
 
     switch (primType) {
     case NV2A_PRIM_TRIANGLES:
         topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         expanded = v2d;
+        expandedEx = v2dEx;
         break;
     case NV2A_PRIM_TRISTRIP:
         topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
         expanded = v2d;
+        expandedEx = v2dEx;
         break;
     case NV2A_PRIM_TRIFAN:
         topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -9369,6 +9942,7 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
             expanded.push_back(v2d[0]);
             expanded.push_back(v2d[i]);
             expanded.push_back(v2d[i+1]);
+            pushEx3(0, i, i+1);
         }
         break;
     case NV2A_PRIM_QUADS:
@@ -9376,21 +9950,31 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
         for (uint32_t i = 0; i + 3 < vtxCount; i += 4) {
             expanded.push_back(v2d[i]);   expanded.push_back(v2d[i+1]); expanded.push_back(v2d[i+2]);
             expanded.push_back(v2d[i]);   expanded.push_back(v2d[i+2]); expanded.push_back(v2d[i+3]);
+            pushEx3(i, i+1, i+2); pushEx3(i, i+2, i+3);
+        }
+        break;
+    case NV2A_PRIM_QUADSTRIP:
+        topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        for (uint32_t i = 0; i + 3 < vtxCount; i += 2) {
+            expanded.push_back(v2d[i]);   expanded.push_back(v2d[i+1]); expanded.push_back(v2d[i+2]);
+            expanded.push_back(v2d[i+1]); expanded.push_back(v2d[i+3]); expanded.push_back(v2d[i+2]);
+            pushEx3(i, i+1, i+2); pushEx3(i+1, i+3, i+2);
         }
         break;
     default:
         topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         expanded = v2d;
+        expandedEx = v2dEx;
         break;
     }
 
     if (!expanded.empty()) {
         g_b2dCallerTag = "DVUP";
         g_b2dBase = base;
-
-        bool isRHW = (fvf & D3DFVF_XYZRHW) != 0;
+        const Vtx2DEx* exPtr = expandedEx.empty() ? nullptr : expandedEx.data();
         HLE_DrawBatch2D(expanded.data(), static_cast<uint32_t>(expanded.size()),
-                        topo, srv, isAlphaOnly, isRHW);
+                        topo, srv, isAlphaOnly,
+                        exPtr, static_cast<uint32_t>(expandedEx.size()));
         g_b2dBase = nullptr;
     }
 
@@ -9404,9 +9988,14 @@ void D3DDevice_DrawIndexedVertices(X86Context& ctx, uint8_t* base) {
 
     uint32_t vbAddr = X86_MEM_READ_u32(base, kDeviceAddr + 0x1660);
     uint32_t stride = X86_MEM_READ_u32(base, kDeviceAddr + 0x1664);
-    if (pIndexData == 0 || vbAddr == 0 || indexCount == 0 || stride < 20) {
+    if (vbAddr == 0 || indexCount == 0 || stride < 20) {
         GuestStackCleanup(ctx, 12); return;
     }
+
+    // ADD THIS: Safely resolve the data pointer
+    uint32_t vbData = X86_MEM_READ_u32(base, vbAddr + 4);
+    if (vbData == 0) vbData = vbAddr + 0x0C; // fallback: inline data
+    vbData &= 0x3FFFFFFFu;
 
     // Drain any inline NV2A push-buffer writes (constants etc.) before
     // checking shader-program preconditions.
@@ -9414,34 +10003,21 @@ void D3DDevice_DrawIndexedVertices(X86Context& ctx, uint8_t* base) {
 
     // Programmable vertex shader path — transform via NV2A constants (3D).
     uint32_t liveVSi = LiveVSHandle(base);
-    static int s_drawProbeI = 0;
-    if (s_drawProbeI < 20) {
-        fprintf(stderr,
-            "[HLE] DrawIndexedVertices prim=%u ic=%u stride=%u vb=0x%X idx=0x%X "
-            "liveVS=0x%X mvp=%d\n",
-            primType, indexCount, stride, vbAddr, pIndexData,
-            liveVSi, (int)HasMvpConstants(base));
-        s_drawProbeI++;
-    }
     bool hasProgVSi = (liveVSi != 0) && (g_vsByHandle.find(liveVSi) != g_vsByHandle.end());
     if (hasProgVSi && g_d3d11.vs3D && HasMvpConstants(base)) {
-        static int s_log3Di = 0;
-        if (s_log3Di < 8) {
-            // fprintf(stderr,
-            //     "[HLE] Draw3D(indexed) prim=%u ic=%u stride=%u vb=0x%X idx=0x%X\n",
-            //     primType, indexCount, stride, vbAddr, pIndexData);
-            s_log3Di++;
+        // FIX: If pIndexData is 0, the game is faking a non-indexed draw. 
+        // Route to HLE_Draw3D using indexCount as the vertexCount.
+        if (pIndexData == 0) {
+            HLE_Draw3D(base, primType, 0, indexCount, 0, 0);
+        } else {
+            HLE_Draw3D(base, primType, 0, 0, indexCount, pIndexData);
         }
-        HLE_Draw3D(base, primType, 0, 0, indexCount, pIndexData);
         GuestStackCleanup(ctx, 12);
         return;
     }
+    
+    // --- 2D Fallback Path ---
     {
-        // Diagnostic: this draw fell through to the 2D-fallback. Log why,
-        // capped per (liveVS, reason) to avoid log spam. The 2D fallback
-        // uses VS=B3_VS_2D_screen + PS=B3_PS_2D_Untextured and treats the
-        // first 8 bytes of each vertex as screen-space pixels — wrong for
-        // any 3D draw, hence the multicolored corrupt geometry.
         const char* why =
             !hasProgVSi            ? "no-prog-VS" :
             !g_d3d11.vs3D          ? "no-vs3D"    :
@@ -9464,56 +10040,63 @@ void D3DDevice_DrawIndexedVertices(X86Context& ctx, uint8_t* base) {
     bool useTexture  = (texAddr != 0) && (g_currentPSHandle != 0 || ColorOpUsesTexture());
     ID3D11ShaderResourceView* srv = nullptr;
     bool isAlphaOnly = false;
-    if (g_nv2aTexture[0].dirty) {
-        srv = ResolveNV2ATextureSRV(base, 0);
-    } else if (useTexture) {
-        srv = GetOrCreateTextureSRV(base, texAddr);
-    } else {
-        srv = ResolveNV2ATextureSRV(base, 0);
-    }
-
-    if (srv && !g_nv2aTexture[0].dirty && texAddr) {
-        auto it = g_d3d11.textureCache.find(texAddr);
-        if (it != g_d3d11.textureCache.end())
-            isAlphaOnly = it->second.isAlphaOnly;
-    }
+    uint32_t texW = 1, texH = 1;
     
-    if (!srv) {
-        for (uint32_t stage = 1; stage < 4; ++stage) {
-            uint32_t a = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + stage * 4);
-            if (g_nv2aTexture[stage].dirty) {
-                srv = ResolveNV2ATextureSRV(base, stage);
-            } else if (a) {
-                srv = GetOrCreateTextureSRV(base, a);
-            } else {
-                srv = ResolveNV2ATextureSRV(base, stage);
-            }
-            
-            if (srv) {
-                texAddr = a;
-                if (!g_nv2aTexture[stage].dirty && a) {
-                    auto it = g_d3d11.textureCache.find(a);
-                    if (it != g_d3d11.textureCache.end())
-                        isAlphaOnly = it->second.isAlphaOnly;
-                }
-                break;
+    if (useTexture) {
+        srv = ResolveShaderResourceView(base, 0, 0, &isAlphaOnly, nullptr, &texW, &texH);
+        if (!srv) {
+            for (uint32_t stage = 1; stage < 4; ++stage) {
+                srv = ResolveShaderResourceView(base, stage, 0, &isAlphaOnly, nullptr, &texW, &texH);
+                if (srv) break;
             }
         }
+    }
+
+    bool uvInPixels = false;
+    if (stride != 28 && srv && texW > 1 && texH > 1) {
+        float maxUV = 0.0f;
+        uint32_t checkCount = std::min<uint32_t>(indexCount, 16);
+        for (uint32_t i = 0; i < checkCount; i++) {
+            uint32_t idx = pIndexData ? X86_MEM_READ_u16(base, pIndexData + i * 2) : i;
+            uint32_t off = vbData + idx * stride;
+            float us, vs;
+            memcpy(&us, base + off + 8,  4);
+            memcpy(&vs, base + off + 12, 4);
+            if (fabsf(us) > maxUV) maxUV = fabsf(us);
+            if (fabsf(vs) > maxUV) maxUV = fabsf(vs);
+        }
+        uvInPixels = (maxUV > 1.5f);
     }
 
     auto readVtx = [&](uint32_t idx) -> Vtx2D {
-        uint32_t off = vbAddr + idx * stride;
+        uint32_t off = vbData + idx * stride; 
         float x, y, u = 0.f, v = 0.f;
+        uint32_t col = 0xFFFFFFFF;
         memcpy(&x, base + off, 4);
         memcpy(&y, base + off + 4, 4);
-        if (stride >= 24) {
-            memcpy(&u, base + off + 8,  4);
-            memcpy(&v, base + off + 12, 4);
+
+        if (stride == 28) {
+            col = X86_MEM_READ_u32(base, off + 16);
+            memcpy(&u, base + off + 20, 4);
+            memcpy(&v, base + off + 24, 4);
+        } else {
+            float ur, vr;
+            memcpy(&ur, base + off + 8,  4);
+            memcpy(&vr, base + off + 12, 4);
+            col = X86_MEM_READ_u32(base, off + 16);
+            
+            if (uvInPixels) {
+                u = ur / static_cast<float>(texW);
+                v = vr / static_cast<float>(texH);
+            } else {
+                u = ur; v = vr;
+            }
         }
-        uint32_t col = X86_MEM_READ_u32(base, off + 16);
         return {x, y, u, v, col};
     };
+
     auto readIdx = [&](uint32_t i) -> uint32_t {
+        if (pIndexData == 0) return i; 
         return static_cast<uint32_t>(X86_MEM_READ_u16(base, pIndexData + i * 2));
     };
 
@@ -9552,6 +10135,14 @@ void D3DDevice_DrawIndexedVertices(X86Context& ctx, uint8_t* base) {
             auto v2 = readVtx(readIdx(i+2)), v3 = readVtx(readIdx(i+3));
             expanded.push_back(v0); expanded.push_back(v1); expanded.push_back(v2);
             expanded.push_back(v0); expanded.push_back(v2); expanded.push_back(v3);
+        }
+        break;
+    case NV2A_PRIM_QUADSTRIP:
+        for (uint32_t i = 0; i + 3 < indexCount; i += 2) {
+            auto v0 = readVtx(readIdx(i)),   v1 = readVtx(readIdx(i+1));
+            auto v2 = readVtx(readIdx(i+2)), v3 = readVtx(readIdx(i+3));
+            expanded.push_back(v0); expanded.push_back(v1); expanded.push_back(v2);
+            expanded.push_back(v1); expanded.push_back(v3); expanded.push_back(v2);
         }
         break;
     default:
@@ -9703,14 +10294,23 @@ void D3DDevice_IsFencePending(X86Context& ctx, uint8_t* base) {
 }
 
 void D3DDevice_BeginPush(X86Context& ctx, uint8_t* base) {
-    static bool logged = false;
-    if (!logged) { fprintf(stderr, "[HLE-STUB] D3DDevice_BeginPush (0x00351C20) called\n"); logged = true; }
+    // Ensure the IM push-buffer ring is allocated.
+    EnsureIMPushBuffer(base);
+    // The original reads pDevice = [0x35FB48] (= 0 in our setup) then
+    // returns m_pPush = [pDevice] as the write pointer.  We always reset
+    // the ring to its base so callers write into safe IM-ring memory instead
+    // of whatever stale ctx.eax happened to hold.
+    uint32_t pDevice = X86_MEM_READ_u32(base, 0x35FB48u);  // = 0
+    X86_MEM_WRITE_u32(base, pDevice, g_pbIMBase);           // Reset IM ring PUT
+    ctx.eax = g_pbIMBase;
     GuestStackCleanup(ctx, 4);
 }
 
 void D3DDevice_EndPush(X86Context& ctx, uint8_t* base) {
-    static bool logged = false;
-    if (!logged) { fprintf(stderr, "[HLE-STUB] D3DDevice_EndPush (0x00351C80) called\n"); logged = true; }
+    // The original writes new_put = [esp+4] back into [pDevice] = [0].
+    uint32_t newPut  = GuestArg32(ctx, base, 0);
+    uint32_t pDevice = X86_MEM_READ_u32(base, 0x35FB48u);  // = 0
+    X86_MEM_WRITE_u32(base, pDevice, newPut);
     GuestStackCleanup(ctx, 4);
 }
 
@@ -10160,13 +10760,21 @@ void D3D_PixelJar_EncodeFormat(X86Context& ctx, uint8_t* base) {
                        | ((logP & 0xF) << X_D3DFORMAT_PSIZE_SHIFT);
 
     // ---------- Encode Size DWORD ----------
-    uint32_t pitchLog = 0;
-    if (pitch >= 64)
-        pitchLog = (pitch / 64) - 1;
+    // On real Xbox, swizzled (non-linear, non-DXT) textures store sizeField = 0.
+    // Only linear and DXT textures encode dimensions in the Size DWORD.
+    // FindSurfaceWithinTexture uses sizeField != 0 as the selector for the linear path,
+    // so writing a non-zero sizeDword for swizzled textures causes it to return the same
+    // data address for every mip level, breaking bloom/post-FX mip chain rendering.
+    uint32_t sizeDword = 0;
+    if (isLinear || isDXT) {
+        uint32_t pitchLog = 0;
+        if (pitch >= 64)
+            pitchLog = (pitch / 64) - 1;
 
-    uint32_t sizeDword = ((width  - 1) & X_D3DSIZE_WIDTH_MASK)
-                       | (((height - 1) & 0xFFF) << X_D3DSIZE_HEIGHT_SHIFT)
-                       | ((pitchLog & 0xFF) << X_D3DSIZE_PITCH_SHIFT);
+        sizeDword = ((width  - 1) & X_D3DSIZE_WIDTH_MASK)
+                  | (((height - 1) & 0xFFF) << X_D3DSIZE_HEIGHT_SHIFT)
+                  | ((pitchLog & 0xFF) << X_D3DSIZE_PITCH_SHIFT);
+    }
 
     // ---------- Write outputs ----------
     if (pFmtOut)  X86_MEM_WRITE_u32(base, pFmtOut, fmtDword);
@@ -11238,194 +11846,11 @@ void __rwXbCacheInit(X86Context& ctx, uint8_t* base)
     GuestStackCleanup(ctx, 0);
 }
 
-// ============================================================================
-// Post-Processing Hooks (Bloom & Blur)
-// ============================================================================
-
-// sub_1AD350 — Bloom single-pass renderer.
-//
-// Called from sub_1AE6F0 three times per bloom chain:
-//   Pass 0: RT = bloom mip 0,   src = scene          → opaque downsample
-//   Pass 1: RT = bloom mip 1,   src = bloom mip 0    → opaque blur/copy
-//   Pass 2: RT = back buffer,   src = bloom mip 1    → ADDITIVE composite
-//
-// The Xbox code programs blend state via D3DDevice_SetRenderState which does
-// NOT always feed through WalkPushBuffer, so g_alphaBlendEnabled can be stale.
-// We therefore determine blend from the render-target type rather than trusting
-// the tracked NV2A state:
-//   - Guest mip RT  → bsOpaque (straight copy, builds the downsample chain)
-//   - Back buffer   → ONE+ONE additive (overlay bloom on the rendered scene)
-//
-// Without this distinction every pass would write the source texture opaquely
-// to the back buffer — replacing the scene entirely (car-select fullscreen
-// car-texture bug) and wiping the environment during races.
-void sub_1AD350(X86Context& ctx, uint8_t* base) {
-    if (!g_d3d11.initialized || !g_d3d11.pipelineReady ||
-        !g_d3d11.vs2D || !g_d3d11.il2D || !g_d3d11.psModulate ||
-        !g_d3d11.dynamicVB || !g_d3d11.cb2D) {
-        GuestReturn32(ctx, 0);
-        GuestStackCleanup(ctx, 8);
-        return;
-    }
-
-    WalkPushBuffer(base);
-
-    // Capture the GuestRT that was active before BindActiveRenderTarget
-    // potentially clears it. For the composite pass (back buffer target),
-    // this is the bloom mip that was just rendered into and is our source.
-    GuestRT* prevGuestRT    = g_d3d11.activeGuestRT;
-    uint32_t prevGuestRTMip = g_d3d11.activeGuestRTMip;
-
-    bool isGuestMip = BindActiveRenderTarget(base, false);
-
-    uint32_t texAddr = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00);
-    ID3D11ShaderResourceView* srv = nullptr;
-
-    if (!isGuestMip && prevGuestRT && prevGuestRT->srv) {
-        // Composite pass: source is the bloom GuestRT that the previous
-        // mip pass rendered into. Use the SRV that excludes the mip we
-        // were just writing to, to avoid any RTV/SRV hazard.
-        if (prevGuestRTMip > 0 &&
-            prevGuestRTMip < prevGuestRT->srvSrcExclMip.size() &&
-            prevGuestRT->srvSrcExclMip[prevGuestRTMip]) {
-            srv = prevGuestRT->srvSrcExclMip[prevGuestRTMip];
-        } else {
-            srv = prevGuestRT->srv;
-        }
-    } else {
-        // Mip downsample/blur pass: source comes from the NV2A pushbuffer
-        // texture state (scene or previous mip), not the stale HLE slot.
-        if (g_nv2aTexture[0].dirty || g_nv2aTexture[0].offset != 0) {
-            srv = ResolveNV2ATextureSRV(base, 0);
-            g_nv2aTexture[0].dirty = false;
-        }
-        if (!srv && texAddr) {
-            srv = GetOrCreateTextureSRV(base, texAddr);
-        }
-    }
-
-    if (!srv) {
-        GuestReturn32(ctx, 0);
-        GuestStackCleanup(ctx, 8);
-        return;
-    }
-
-    static int s_log = 0;
-    if (s_log++ < 16) {
-        fprintf(stderr,
-            "[HLE] bloom pass: isGuestMip=%d prevRT=%p prevMip=%u srv=%p"
-            " texAddr=0x%08X blendEn=%d src=0x%X dst=0x%X\n",
-            (int)isGuestMip, (void*)prevGuestRT, prevGuestRTMip, (void*)srv,
-            texAddr, (int)g_alphaBlendEnabled, g_blendSrc, g_blendDst);
-    }
-
-    // Fullscreen quad in screen-space.
-    // vs2D: pos (0..W, 0..H) / screenSize (W, H) → NDC [-1..+1].
-    // BindActiveRenderTarget sets the D3D11 viewport to the mip dimensions so
-    // the full-NDC quad correctly covers the destination surface regardless of
-    // whether it is 720×480 (backbuffer) or 64×64 (bloom mip).
-    const float W = static_cast<float>(g_d3d11.width);
-    const float H = static_cast<float>(g_d3d11.height);
-    const Vtx2D quad[4] = {
-        { 0.f, 0.f, 0.f, 0.f, 0xFFFFFFFFu },
-        { W,   0.f, 1.f, 0.f, 0xFFFFFFFFu },
-        { 0.f, H,   0.f, 1.f, 0xFFFFFFFFu },
-        { W,   H,   1.f, 1.f, 0xFFFFFFFFu },
-    };
-    constexpr uint32_t kNVerts   = 4;
-    constexpr uint32_t kVBNeeded = kNVerts * sizeof(Vtx2D);
-
-    if (kVBNeeded > g_d3d11.dynamicVBSize) {
-        GuestReturn32(ctx, 0);
-        GuestStackCleanup(ctx, 8);
-        return;
-    }
-
-    D3D11_MAPPED_SUBRESOURCE mr = {};
-    if (FAILED(g_d3d11.context->Map(g_d3d11.dynamicVB, 0,
-                                     D3D11_MAP_WRITE_DISCARD, 0, &mr))) {
-        GuestReturn32(ctx, 0);
-        GuestStackCleanup(ctx, 8);
-        return;
-    }
-    memcpy(mr.pData, quad, kVBNeeded);
-    g_d3d11.context->Unmap(g_d3d11.dynamicVB, 0);
-
-    if (SUCCEEDED(g_d3d11.context->Map(g_d3d11.cb2D, 0,
-                                        D3D11_MAP_WRITE_DISCARD, 0, &mr))) {
-        float* cb = static_cast<float*>(mr.pData);
-        cb[0] = W; cb[1] = H; cb[2] = 0.f; cb[3] = 0.f;
-        g_d3d11.context->Unmap(g_d3d11.cb2D, 0);
-    }
-
-    // Bind the RT set by the Xbox code.  Returns true  → we're on a guest mip
-    // (downsample/blur pass).  Returns false → we're on the back buffer
-    // (composite pass).
-    isGuestMip = BindActiveRenderTarget(base, false);
-
-    float bf[4] = { 1.f, 1.f, 1.f, 1.f };
-    ID3D11BlendState* bs;
-    if (isGuestMip) {
-        // Downsample / blur into the bloom mip pyramid — straight copy.
-        bs = g_d3d11.bsOpaque;
-    } else {
-        // Composite to back buffer — additive (ONE+ONE) so the bloom overlays
-        // the already-rendered scene instead of replacing it.
-        // NV factor 0x0001 = D3D11_BLEND_ONE (see NvBlendFactorToD3D11).
-        bs = GetOrCreateBlendState(
-            0x0001u, 0x0001u,   // SRC=ONE, DST=ONE
-            true,                // blend enabled
-            g_colorWriteMask,
-            g_blendEquation);
-        if (!bs) bs = g_d3d11.bsAlpha;
-    }
-
-    SC_BlendState(bs, bf, 0xFFFFFFFFu);
-    SC_DepthStencil(g_d3d11.dssOff, 0);
-    SC_Raster(g_d3d11.rsNoCull);
-
-    SC_VS(g_d3d11.vs2D);
-    SC_VSCB0(g_d3d11.cb2D);
-    SC_IL(g_d3d11.il2D);
-    SC_PS(g_d3d11.psModulate);  // tex × vtx_color; vtx_color = white → passthrough
-
-    ID3D11ShaderResourceView* srvs[1]  = { srv };
-    ID3D11SamplerState*       samps[1] = { g_d3d11.samplerLinear };
-    SC_PSSRVs(1, srvs);
-    SC_PSSamplers(1, samps);
-
-    UINT stride = sizeof(Vtx2D), offset = 0;
-    SC_VB(g_d3d11.dynamicVB, stride, offset);
-    SC_Topology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    g_d3d11.context->Draw(kNVerts, 0);
-
-    // Detach SRV to prevent D3D11 read/write-hazard warnings on the next bind.
-    ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
-    SC_PSSRVs(1, nullSRV);
-
-    // static int s_log = 0;
-    // if (s_log++ < 8) {
-    //     fprintf(stderr,
-    //         "[HLE] bloom pass: texAddr=0x%08X srv=%p isGuestMip=%d"
-    //         " blendEn=%d src=0x%X dst=0x%X\n",
-    //         texAddr, (void*)srv, (int)isGuestMip,
-    //         (int)g_alphaBlendEnabled, g_blendSrc, g_blendDst);
-    // }
-
-    GuestReturn32(ctx, 0);
-    GuestStackCleanup(ctx, 8);
+// sub_1ACD20 (0x1ACD20): per-player letterbox renderer.
+// Draws black screen-space bars at the top/bottom of each player viewport via
+// D3DDevice_DrawVerticesUP (TRIANGLEFAN, stride=32, no texture).
+// On PC we render full-frame without letter-box bars, and this draw fires
+// while bloom render-target state is still active, causing the black geometry
+// to corrupt the blur-composite result.  Disable by doing nothing.
+void sub_1ACD20(X86Context& ctx, uint8_t* base) {
 }
-
-// void sub_1AD7A0(X86Context& ctx, uint8_t* base) {
-//     fprintf(stderr, "[HLE] Custom Blur Render Pass 1 Executed\n");
-//     // TODO: Invoke custom D3D11 blur downsample pass
-//     GuestReturn32(ctx, 0);
-//     GuestStackCleanup(ctx, 4);
-// }
-
-// void sub_1ADD60(X86Context& ctx, uint8_t* base) {
-//     fprintf(stderr, "[HLE] Custom Blur Render Pass 2 Executed\n");
-//     // TODO: Invoke custom D3D11 blur resolve pass
-//     GuestReturn32(ctx, 0);
-//     GuestStackCleanup(ctx, 4);
-// }

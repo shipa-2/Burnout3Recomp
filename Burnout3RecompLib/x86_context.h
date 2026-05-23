@@ -622,13 +622,13 @@ extern std::unordered_map<uint32_t, const char*> g_thunkNames;
 // Used by the HLE override of the Xbox debug CRT malloc (sub_8A92E).
 uint32_t GuestMalloc(uint32_t size, uint8_t* base);
 
-void X86_INIT_FUNC_MAP() {
+inline void X86_INIT_FUNC_MAP() {
     for (int i = 0; X86FuncMappings[i].hostFunc; i++) {
         g_funcMap[X86FuncMappings[i].guestAddr] = X86FuncMappings[i].hostFunc;
     }
 }
 
-void X86_CALL_INDIRECT(X86Context& ctx, uint8_t* base, uint32_t addr) {
+inline void X86_CALL_INDIRECT(X86Context& ctx, uint8_t* base, uint32_t addr) {
     if (addr == 0) {
         // Null function pointer — no callback installed, treat as no-op.
         return;
@@ -675,7 +675,7 @@ void X86_CALL_INDIRECT(X86Context& ctx, uint8_t* base, uint32_t addr) {
     }
 }
 
-void X86_JMP_INDIRECT(X86Context& ctx, uint8_t* base, uint32_t addr) {
+inline void X86_JMP_INDIRECT(X86Context& ctx, uint8_t* base, uint32_t addr) {
     if (addr == 0) {
         return;
     }

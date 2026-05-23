@@ -53,7 +53,7 @@ endif()
 # static library by accepting multiple definitions.  The exe's .obj files
 # are linked first so they take priority.
 if(MSVC)
-    target_link_options(Burnout3Recomp PRIVATE /FORCE:MULTIPLE)
+    target_link_options(Burnout3Recomp PRIVATE /FORCE:MULTIPLE /MAP)
     # Disable LTCG to avoid "Generating Code..." hang with massive recomp files.
     string(REPLACE "/GL" "" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
     target_compile_options(Burnout3Recomp PRIVATE /GL-)
@@ -77,6 +77,20 @@ if(MSVC)
     set_target_properties(Burnout3Recomp PROPERTIES
         WIN32_EXECUTABLE FALSE
     )
+
+    # Copy the matching MSVC CRT DLLs next to the exe after every build so that
+    # the stale system32 msvcp140.dll (which may be an older version) is never
+    # loaded instead.  Windows prefers a DLL in the same directory as the exe.
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
+    include(InstallRequiredSystemLibraries)
+    foreach(_crt_dll ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS})
+        add_custom_command(TARGET Burnout3Recomp POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_crt_dll}"
+                "$<TARGET_FILE_DIR:Burnout3Recomp>"
+            COMMENT "Copying CRT DLL: ${_crt_dll}"
+        )
+    endforeach()
 else()
     target_compile_options(Burnout3Recomp PRIVATE
         -Wall -Wno-switch -Wno-unused-variable -Wno-unused-function

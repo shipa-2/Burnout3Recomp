@@ -716,7 +716,7 @@ Nv2aVsResult TranslateNV2AtoHLSL(const uint32_t* funcTokens, size_t funcBytes,
     hlsl << "    float4 R8=float4(0,0,0,0), R9=float4(0,0,0,0), R10=float4(0,0,0,0), R11=float4(0,0,0,0);\n";
     // R12 is aliased with oPos. HLSL lets us read/write either freely as a
     // local and we copy into SV_Position at the end.
-    hlsl << "    float4 oPos=float4(0,0,0,0);\n";
+    hlsl << "    float4 oPos=float4(0,0,0,1);\n";
     hlsl << "    #define R12 oPos // Xbox R12 is aliased with oPos\n";
     // Default values for unwritten outputs.
     //   oD0 = (1,1,1,1)   B3 map shaders don't write diffuse and expect a
