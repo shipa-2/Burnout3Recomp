@@ -191,6 +191,28 @@ static const char s_vsExHlsl[] =
     "  return o;\n"
     "}\n";
 
+// 2D vertex shader: pre-transformed clip space (used by Tonemapper)
+static const char s_vsHlsl_RHW[] =
+    "cbuffer CB : register(b0) { float2 screenSize; float2 pad; }\n"
+    "struct VS_IN { float4 pos : POSITION; float2 uv : TEXCOORD; float4 col : COLOR; };\n"
+    "struct VS_OUT { float4 pos : SV_POSITION; float4 oD0 : COLOR0; float4 oD1 : COLOR1; float4 oFog : FOG;\n"
+    "  float4 oT0 : TEXCOORD0; float4 oT1 : TEXCOORD1; float4 oT2 : TEXCOORD2; float4 oT3 : TEXCOORD3; };\n"
+    "VS_OUT main(VS_IN v) {\n"
+    "  VS_OUT o;\n"
+    "  o.pos.x =  (v.pos.x / screenSize.x) * 2.0f - 1.0f;\n"
+    "  o.pos.y = -(v.pos.y / screenSize.y) * 2.0f + 1.0f;\n"
+    "  o.pos.z = 0.0f; o.pos.w = 1.0f;\n"
+    "  o.oD0 = v.col; o.oD1 = float4(0,0,0,0); o.oFog = float4(1,1,1,1);\n"
+    "  o.oT0 = float4(v.uv, 0.0f, 1.0f); o.oT1 = float4(v.uv, 0.0f, 1.0f);\n"
+    "  o.oT2 = float4(v.uv, 0.0f, 1.0f); o.oT3 = float4(v.uv, 0.0f, 1.0f);\n"
+    "  return o;\n"
+    "}\n";
+
+// Unified 2D PS Input matching VS_OUT
+static const char s_psInDecl[] = 
+    "struct PS_IN { float4 pos : SV_POSITION; float4 oD0 : COLOR0; float4 oD1 : COLOR1; float4 oFog : FOG;\n"
+    "  float4 oT0 : TEXCOORD0; float4 oT1 : TEXCOORD1; float4 oT2 : TEXCOORD2; float4 oT3 : TEXCOORD3; };\n";
+
 // Untextured pixel shader: use vertex colour only
 static const char s_psUntexturedHlsl[] =
     "struct PS_IN { float4 pos:SV_POSITION; float4 oD0:COLOR0; float4 oD1:COLOR1; float4 oFog:FOG; float4 oT0:TEXCOORD0; float4 oT1:TEXCOORD1; float4 oT2:TEXCOORD2; float4 oT3:TEXCOORD3; };\n"
@@ -1961,6 +1983,19 @@ void D3D_UpdateProjectionViewportTransform(X86Context& ctx, uint8_t* base)
 // Texture management
 // ============================================================================
 
+// ---- NV2A texture state shadowed from the push buffer --------------------
+struct NV2ATextureState {
+    uint32_t offset = 0;   // NV097_SET_TEXTURE_OFFSET  — raw GPU addr
+    uint32_t format = 0;   // context dma + color + logU/V/P + mips + dim
+    uint32_t address = 0;   // wrap modes
+    uint32_t control0 = 0;
+    uint32_t control1 = 0;   // pitch (bits 16..31)
+    uint32_t imageRect = 0;   // (width-1 << 16) | (height-1)
+    uint32_t palette = 0;
+    bool     dirty = false;
+};
+static NV2ATextureState g_nv2aTexture[4];
+
 // D3DDevice_SetTexture  (0x96FD0) — 2 args, ret 8
 extern uint32_t g_currentPSHandle; // defined later in file
 extern uint32_t g_texBoundSource[4];
@@ -2532,15 +2567,6 @@ static void ProcessNV2AMethod(uint32_t method, uint32_t value) {
             g_pshConstants[slot][2] = ((value >>  0) & 0xFF) / 255.0f; // B
             g_pshConstants[slot][3] = ((value >> 24) & 0xFF) / 255.0f; // A
             g_pshConstantsDirty |= (1u << slot);
-            // Log slot 2 always (it's fc0 for the tonemapper PSH 0x00900000).
-            // Other slots: log first 8 occurrences each to avoid noise.
-            static int s_logCount[16] = {};
-            if (slot == 2 || s_logCount[slot] < 8) {
-                ++s_logCount[slot];
-                fprintf(stderr,
-                    "[PSH] combiner factor slot=%u (method=0x%04X) value=0x%08X\n",
-                    slot, method, value);
-            }
         }
     }
     // NV097_SET_COMBINER_SPECULAR_FOG_CW0 (0x1E20) and CW1 (0x1E24): the
@@ -5658,6 +5684,14 @@ void D3DDevice_CopyRects(X86Context& ctx, uint8_t* base)
     if (!g_d3d11.initialized || !g_d3d11.context) { cleanup(); return; }
     if (pSrcSurf == 0 || pDstSurf == 0)            { cleanup(); return; }
 
+    static bool s_diag_enabled = std::getenv("B3_DIAG_POSTFX") != nullptr;
+    if (s_diag_enabled) {
+        uint32_t srcData = pSrcSurf ? X86_MEM_READ_u32(base, pSrcSurf + 4) : 0;
+        uint32_t dstData = pDstSurf ? X86_MEM_READ_u32(base, pDstSurf + 4) : 0;
+        fprintf(stderr, "[DIAG] CopyRects: SrcSurf=0x%08X (Data: 0x%08X) -> DstSurf=0x%08X (Data: 0x%08X)\n",
+            pSrcSurf, srcData, pDstSurf, dstData);
+    }
+
     CopyRectsResource src{}, dst{};
     if (!ResolveCopyRectsResource(base, pSrcSurf, /*forWrite*/false, src) ||
         !ResolveCopyRectsResource(base, pDstSurf, /*forWrite*/true,  dst))
@@ -7341,9 +7375,9 @@ static void InitRenderingPipeline()
                                            blob->GetBufferSize(), nullptr, pp);
         blob->Release();
     };
-    compPS(s_psUntexturedHlsl, &g_d3d11.psUntextured);
-    compPS(s_psAlphaHlsl,      &g_d3d11.psAlpha);
-    compPS(s_psModulateHlsl,   &g_d3d11.psModulate);
+    compPS(s_psUntexturedHlsl.c_str(), &g_d3d11.psUntextured);
+    compPS(s_psAlphaHlsl.c_str(),      &g_d3d11.psAlpha);
+    compPS(s_psModulateHlsl.c_str(),   &g_d3d11.psModulate);
     SetD3DName(g_d3d11.psUntextured, "B3_PS_2D_Untextured");
     SetD3DName(g_d3d11.psAlpha,      "B3_PS_2D_AlphaOnly");
     SetD3DName(g_d3d11.psModulate,   "B3_PS_2D_Modulate");
@@ -7903,6 +7937,8 @@ static bool BindTranslatedPSFor2D(uint8_t* base, TranslatedPS* tps)
 {
     if (!tps || !tps->ps || !g_d3d11.cbPS) return false;
 
+    // Restore the RS shadow reads. RenderWare 2D draws (like tonemap) rely on the
+    // software state cache which flushes directly into these arrays, bypassing NV2A inline pushes.
     constexpr uint32_t kRSShadowBase  = 0x35FB58;
     constexpr uint32_t kRWPendingBase = 0x75D4A0;
     constexpr uint32_t kPSConstRsIdx  = 10;
@@ -7930,10 +7966,12 @@ static bool BindTranslatedPSFor2D(uint8_t* base, TranslatedPS* tps)
     if (g_psFinalCombinerConst[0] != 0) fcArgb[0] = g_psFinalCombinerConst[0];
     if (g_psFinalCombinerConst[1] != 0) fcArgb[1] = g_psFinalCombinerConst[1];
     for (int k = 0; k < 2; ++k) {
-        uint32_t rs = 26u + (uint32_t)k;
-        if (rs < kHLERenderStateCount) {
-            uint32_t v = g_hleRenderStateCache[rs];
-            if (v != 0) fcArgb[k] = v;
+        if (g_psFinalCombinerConst[k] == 0) {
+            uint32_t rs = 26u + (uint32_t)k;
+            if (rs < kHLERenderStateCount) {
+                uint32_t v = g_hleRenderStateCache[rs];
+                if (v != 0) fcArgb[k] = v;
+            }
         }
     }
     for (int k = 0; k < 2; ++k) {
@@ -8874,27 +8912,23 @@ static void HLE_Draw3D(uint8_t* base,
     bool colorOpOk = ColorOpUsesTexture();
     (void)colorOpOk;
     if (texAddr) {
-        srv = GetOrCreateTextureSRV(base, texAddr);
-    }
-    if (!srv) {
+        srv = g_nv2aTexture[0].dirty ? ResolveNV2ATextureSRV(base, 0) : GetOrCreateTextureSRV(base, texAddr);
+    } else {
         srv = ResolveNV2ATextureSRV(base, 0);
     }
     // PP fullscreen-quad fallback: try stages 1..3 if stage 0 is empty.
-    // Many Burnout 3 PP passes (bloom composite, motion-blur darken) bind
-    // the scene/RT texture at a non-zero stage and rely on a programmable
-    // pixel shader we can't translate yet.
     if (!srv) {
         for (uint32_t stage = 1; stage < 4; ++stage) {
             uint32_t a = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + stage * 4);
-            if (a == 0) continue;
-            ID3D11ShaderResourceView* s = GetOrCreateTextureSRV(base, a);
+            ID3D11ShaderResourceView* s = nullptr;
+            if (g_nv2aTexture[stage].dirty) {
+                s = ResolveNV2ATextureSRV(base, stage);
+            } else if (a) {
+                s = GetOrCreateTextureSRV(base, a);
+            } else {
+                s = ResolveNV2ATextureSRV(base, stage);
+            }
             if (s) { srv = s; texAddr = a; break; }
-        }
-    }
-    if (!srv) {
-        for (uint32_t stage = 1; stage < 4; ++stage) {
-            ID3D11ShaderResourceView* s = ResolveNV2ATextureSRV(base, stage);
-            if (s) { srv = s; break; }
         }
     }
     {
@@ -9123,10 +9157,12 @@ static void HLE_Draw3D(uint8_t* base,
             if (g_psFinalCombinerConst[0] != 0) fcArgb[0] = g_psFinalCombinerConst[0];
             if (g_psFinalCombinerConst[1] != 0) fcArgb[1] = g_psFinalCombinerConst[1];
             for (int k = 0; k < 2; ++k) {
-                uint32_t rs = 26u + (uint32_t)k;
-                if (rs < kHLERenderStateCount) {
-                    uint32_t v = g_hleRenderStateCache[rs];
-                    if (v != 0) fcArgb[k] = v;
+                if (g_psFinalCombinerConst[k] == 0) {
+                    uint32_t rs = 26u + (uint32_t)k;
+                    if (rs < kHLERenderStateCount) {
+                        uint32_t v = g_hleRenderStateCache[rs];
+                        if (v != 0) fcArgb[k] = v;
+                    }
                 }
             }
             for (int k = 0; k < 2; ++k) {
@@ -9161,8 +9197,18 @@ static void HLE_Draw3D(uint8_t* base,
             if (tps->usesStage[s]) {
                 uint32_t addr = X86_MEM_READ_u32(base, kDeviceAddr + 0x0B00 + s * 4);
                 stageAddr[s] = addr;
-                if (addr) stageSrv = GetOrCreateTextureSRV(base, addr);
-                if (!stageSrv) stageSrv = ResolveNV2ATextureSRV(base, s);
+                
+                if (g_nv2aTexture[s].dirty) {
+                    stageSrv = ResolveNV2ATextureSRV(base, s);
+                } else if (addr) {
+                    stageSrv = GetOrCreateTextureSRV(base, addr);
+                } else {
+                    stageSrv = ResolveNV2ATextureSRV(base, s);
+                }
+
+                if (!stageSrv && g_psTexHandleSnapshot[s]) {
+                    stageSrv = GetOrCreateTextureSRV(base, g_psTexHandleSnapshot[s]);
+                }
             }
             srvs[s]  = stageSrv;
             samps[s] = g_d3d11.samplerWrap;
@@ -9348,7 +9394,7 @@ static void DrawSWVertsD3D11(uint8_t* base, const SWVertex* sv, size_t n, int pr
     if (!verts.empty()) {
         g_b2dCallerTag = "SW";
         g_b2dBase = base;
-        HLE_DrawBatch2D(verts.data(), static_cast<uint32_t>(verts.size()), topo, srv, isAlphaOnly);
+        HLE_DrawBatch2D(verts.data(), static_cast<uint32_t>(verts.size()), topo, srv, isAlphaOnly, true);
         g_b2dBase = nullptr;
     }
 }
@@ -9650,7 +9696,9 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
             if (fabsf(us) > maxUV) maxUV = fabsf(us);
             if (fabsf(vs) > maxUV) maxUV = fabsf(vs);
         }
-        uvInPixels = (maxUV > 1.5f);
+        // Tighten the pixel coordinate heuristic. Standard UVs are [0.0, 1.0]. 
+        // A tonemapper quad with 1.0 will not trigger this.
+        uvInPixels = (maxUV > 2.0f);
     }
 
     // Determine whether to build extended (4-UV) vertex data for translated-PS draws.
@@ -9762,11 +9810,52 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
 
     for (uint32_t i = 0; i < vtxCount; i++) {
         uint32_t off = pVtxData + i * vtxStride;
-        float x, y, u, v;
-        uint32_t col;
-        memcpy(&x, base + off,     4);
-        memcpy(&y, base + off + 4, 4);
-        if (vtxStride == 28) {
+        float x, y, u = 0.0f, v = 0.0f;
+        uint32_t col = 0xFFFFFFFF;
+
+        bool useFVF = (g_currentFVF != 0 && FVFVertexSize(g_currentFVF) == vtxStride);
+
+        if (useFVF) {
+            SWVertex sv = ParseFVFVertex(base + off, g_currentFVF);
+            x = sv.x; y = sv.y; u = sv.u; v = sv.v; col = sv.diffuse;
+        } else if (vtxStride == 24) {
+            uint32_t dw12 = X86_MEM_READ_u32(base, off + 12);
+            uint32_t dw16 = X86_MEM_READ_u32(base, off + 16);
+            
+            bool isXYZ_DIFFUSE_TEX1 = false;
+            if ((dw12 & 0xFF000000) == 0xFF000000 && (dw16 == 0x00000000 || dw16 == 0x3F800000)) {
+                isXYZ_DIFFUSE_TEX1 = true;
+            } else if ((dw16 & 0xFF000000) >= 0x80000000) {
+                isXYZ_DIFFUSE_TEX1 = false;
+            } else {
+                float f12; memcpy(&f12, &dw12, 4);
+                if (std::isnan(f12) || fabsf(f12) > 10000.0f) {
+                    isXYZ_DIFFUSE_TEX1 = true;
+                }
+            }
+
+            if (isXYZ_DIFFUSE_TEX1) {
+                // XYZ | DIFFUSE | TEX1 : X@0, Y@4, Z@8, Col@12, U@16, V@20
+                memcpy(&x, base + off, 4);
+                memcpy(&y, base + off + 4, 4);
+                col = dw12;
+                memcpy(&u, base + off + 16, 4);
+                memcpy(&v, base + off + 20, 4);
+            } else {
+                // RW custom: X@0, Y@4, U@8, V@12, Col@16
+                memcpy(&x, base + off, 4);
+                memcpy(&y, base + off + 4, 4);
+                memcpy(&u, base + off + 8, 4);
+                memcpy(&v, base + off + 12, 4);
+                col = dw16;
+                if (uvInPixels) {
+                    u /= static_cast<float>(texW);
+                    v /= static_cast<float>(texH);
+                }
+            }
+        } else if (vtxStride == 28) {
+            memcpy(&x, base + off,     4);
+            memcpy(&y, base + off + 4, 4);
             // D3DFVF_XYZRHW|DIFFUSE|TEX1: X@0,Y@4,Z@8,W@12,col@16,U@20,V@24
             col = X86_MEM_READ_u32(base, off + 16);
             memcpy(&u, base + off + 20, 4);
@@ -9805,6 +9894,8 @@ void D3DDevice_DrawVerticesUP(X86Context& ctx, uint8_t* base) {
                 v2dEx.push_back(ex);
             }
         } else {
+            memcpy(&x, base + off,     4);
+            memcpy(&y, base + off + 4, 4);
             // RW custom format: X@0,Y@4,U@8,V@12,col@16
             float ur, vr;
             memcpy(&ur, base + off + 8,  4);
@@ -10062,7 +10153,7 @@ void D3DDevice_DrawIndexedVertices(X86Context& ctx, uint8_t* base) {
         g_b2dCallerTag = "DI";
         g_b2dBase = base;
         HLE_DrawBatch2D(expanded.data(), static_cast<uint32_t>(expanded.size()),
-                        topo, srv, isAlphaOnly);
+                        topo, srv, isAlphaOnly, false);
         g_b2dBase = nullptr;
     }
 
