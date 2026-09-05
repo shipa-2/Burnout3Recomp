@@ -2,7 +2,7 @@
 #include <unordered_map>
 #include <cstdio>
 
-X86FuncMapping X86FuncMappings[] = {
+std::unordered_map<uint32_t, X86RecompFunc> g_funcMap = {
     { 0x11000, sub_11000 },
     { 0x11030, sub_11030 },
     { 0x11080, sub_11080 },
@@ -23594,5 +23594,27 @@ X86FuncMapping X86FuncMappings[] = {
     { 0x36B49A, sub_36B49A },
     { 0x36B543, sub_36B543 },
     { 0x36B743, sub_36B743 },
-    { 0, nullptr }
 };
+
+void X86_CALL_INDIRECT(X86Context& ctx, uint8_t* base, uint32_t addr) {
+    auto it = g_funcMap.find(addr);
+    if (it != g_funcMap.end()) {
+        it->second(ctx, base);
+    } else {
+        static int s_missLog = 0;
+        if (s_missLog < 50) {
+            fprintf(stderr, "[X86_CALL_INDIRECT] MISS: target 0x%08X not in g_funcMap!\n", addr);
+            s_missLog++;
+        }
+    }
+}
+
+void X86_JMP_INDIRECT(X86Context& ctx, uint8_t* base, uint32_t addr) {
+    auto it = g_funcMap.find(addr);
+    if (it != g_funcMap.end()) {
+        it->second(ctx, base);
+    } else {
+        fprintf(stderr, "[X86_JMP_INDIRECT] target 0x%08X not found in g_funcMap!\n", addr);
+    }
+}
+
