@@ -1,3 +1,5 @@
+> This is a fork of [mxmstr/Burnout3Recomp](https://github.com/mxmstr/Burnout3Recomp) — see [RESEARCH.md](RESEARCH.md) for this fork's own reverse-engineering notes, function catalogue, and current status/roadmap.
+
 A very WIP PC port of Burnout 3 based on the Xbox version. 
 
 Based on the static recompilation method used by [Unleashed Recompiled](https://github.com/hedge-dev/UnleashedRecomp).
