@@ -9,6 +9,8 @@ Upstream's proof-of-concept release ([mxmstr/Burnout3Recomp/releases](https://gi
 
 Confirmed working in this fork: boots to the title screen at a stable 60 FPS with real audio, shaders, and XInput controller support — no emulator. Currently stuck on the animated loading screen before the intro splash; see [Status](#status).
 
+> **Active development moved to [shipa-2/burnout3](https://github.com/shipa-2/burnout3)** (fork of [sp00nznet/burnout3](https://github.com/sp00nznet/burnout3)), an independent, further-along static recompilation of the same binary — full menu rendering, 37 playable tracks, 67 vehicles, its own self-contained toolchain. This repo is kept public because of one thing that took real effort to recover and is worth having around regardless: the previously-missing generated recompiler output (below).
+
 ## Status
 
 | Area | Status | Notes |
@@ -16,12 +18,13 @@ Confirmed working in this fork: boots to the title screen at a stable 60 FPS wit
 | Binary loaded into Ghidra with full auto-analysis | ✔️ Done | See [Tools](#tools) |
 | Microsoft XDK library functions auto-identified | ✔️ Done | 638 of 8308 functions (via XbSymbolDatabase pattern matching) |
 | Game-code function names recovered | ✔️ 480 of ~7670 | Already present upstream in `Burnout3RecompLib/x86_func_mapping.cpp` — catalogued here |
+| **`Burnout3RecompLib` builds from a fresh clone** | ✔️ **Fixed here** | Upstream declared ~23,591 functions but never committed their bodies (`x86_recomp.*.cpp`, generated locally, likely kept out of git for size) — a fresh clone couldn't link. Regenerated independently via our own build of [mxmstr's x86 XenonRecomp fork](https://github.com/mxmstr/XenonRecomp) against the `burnout3.toml` config already committed there, renamed back to match upstream's naming, verified with a clean standalone build (`cmake` + `ninja`, GCC/Linux) producing `libBurnout3RecompLib.a`. |
 | Boots to a native, standalone executable | ✔️ Done | Stable 60 FPS, working audio, shaders, and XInput — no emulator |
 | Input subsystem (`CB3InputManager`) | ✔️ Already handled | `hle_xinput.cpp` fully HLEs the Xbox kernel calls it depends on — see [research/notes/input-manager.md](research/notes/input-manager.md) |
 | Loading-screen hang before intro splash | 🚧 Diagnosing | See [research/notes/burnout3recomp-loading-hang.md](research/notes/burnout3recomp-loading-hang.md) — leading hypothesis is a synchronous `Kern_NtReadFile` where the game expects an observable pending→complete transition; not yet confirmed with a symbolized debug build |
-| Remaining `sub_XXXXXXXX` placeholders | ❌ ~7187 unnamed | Already correctly recompiled, just uncatalogued — naming/verifying them is documentation work, not new reverse-engineering |
+| Remaining `sub_XXXXXXXX` placeholders | 🚧 ~7187 unnamed | **Already compiling as part of the library** (see above) — what's missing is a human-readable name, not the code itself. Naming/verifying them is a documentation/QA task, not new reverse-engineering |
 
-**8308 total functions** identified by Ghidra's auto-analysis: **638 (7.7%)** are stock Microsoft XDK library code (D3D8, DirectSound, XactEngine, kernel thunks — via XbSymbolDatabase), **480** are Burnout 3's own game code with a real name (already present upstream in `x86_func_mapping.cpp`), leaving **~7187** still to catalogue.
+**8308 total functions** identified by Ghidra's auto-analysis: **638 (7.7%)** are stock Microsoft XDK library code (D3D8, DirectSound, XactEngine, kernel thunks — via XbSymbolDatabase), **480** are Burnout 3's own game code with a real name (already present upstream in `x86_func_mapping.cpp`), leaving **~7187** still to name — all of which already exist as real, compiling, recompiled code (`sub_XXXXXXXX`), not placeholders.
 
 Full raw function inventory (address, name, size, identification source): [`docs/functions.csv`](docs/functions.csv).
 

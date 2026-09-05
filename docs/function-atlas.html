@@ -262,7 +262,9 @@
     <h1>Burnout 3 Function Atlas</h1>
     <p class="dek">
       Every function Ghidra found in <code>default.xbe</code>, one rectangle each, sized by byte length.
-      Grey is untouched. Blue is stock Microsoft XDK library code Cxbx-Reloaded's own database already
+      <strong>Grey means unnamed, not unbuilt</strong> &mdash; every one of these already compiles as
+      real recompiled code in <code>Burnout3RecompLib</code>; what's missing is a human-readable name,
+      not the code itself. Blue is stock Microsoft XDK library code Cxbx-Reloaded's own database already
       recognizes &mdash; not worth reverse-engineering. Purple is Burnout 3's own game code with a real
       name recovered by the <a href="https://github.com/mxmstr/Burnout3Recomp" target="_blank" rel="noopener">Burnout3Recomp</a>
       project. Orange is under active investigation right now. Green is reimplemented and confirmed
@@ -295,14 +297,14 @@
     </div>
     <div class="stat">
       <div class="n">7,187</div>
-      <div class="l">still untouched</div>
+      <div class="l">compiled, not yet named</div>
     </div>
   </div>
 
   <div class="panel">
     <div class="panel-head">
       <div class="legend">
-        <span class="item"><span class="swatch unknown"></span>Unknown</span>
+        <span class="item"><span class="swatch unknown"></span>Unnamed (still compiles)</span>
         <span class="item"><span class="swatch identified"></span>Library code</span>
         <span class="item"><span class="swatch known"></span>Game code, named</span>
         <span class="item"><span class="swatch progress"></span>In progress</span>
